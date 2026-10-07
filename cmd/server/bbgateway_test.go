@@ -102,8 +102,46 @@ func TestBBBridgeFrames(t *testing.T) {
 		if seq := binary.LittleEndian.Uint32(data[4:]); seq != want {
 			t.Fatalf("seq %d, want %d", seq, want)
 		}
-		if s := int16(binary.LittleEndian.Uint16(data[bbHeaderLen:])); s < 16000 || s > 16400 {
-			t.Fatalf("first sample %d, want ~16383", s)
+		// 0.5 in: the AGC (bbagc.go) may only boost it, never past full scale.
+		if s := int16(binary.LittleEndian.Uint16(data[bbHeaderLen:])); s < 16000 {
+			t.Fatalf("first sample %d, want >= ~16383", s)
+		}
+	}
+}
+
+func TestBBAGCBoostsQuietSpeechAndHoldsSilence(t *testing.T) {
+	a := newBBAGC()
+	frame := func(amp float32) []float32 {
+		f := make([]float32, 960)
+		for i := range f {
+			if i%2 == 0 {
+				f[i] = amp
+			} else {
+				f[i] = -amp
+			}
+		}
+		return f
+	}
+	var out []float32
+	for i := 0; i < 200; i++ { // 12 s of speech at -30 dBFS
+		out = frame(0.0316)
+		a.process(out)
+	}
+	if g := a.gain; g < 4 || g > agcMaxGain+0.01 {
+		t.Fatalf("gain after quiet speech %.2f, want 4..8", g)
+	}
+	held := a.gain
+	for i := 0; i < 50; i++ { // silence must not change the gain
+		a.process(frame(0.0005))
+	}
+	if a.gain != held {
+		t.Fatalf("gain moved on silence: %.2f -> %.2f", held, a.gain)
+	}
+	loud := frame(0.9)
+	a.process(loud)
+	for _, s := range loud {
+		if s > 1 || s < -1 {
+			t.Fatalf("sample out of range: %f", s)
 		}
 	}
 }

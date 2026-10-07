@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -75,6 +76,11 @@ type bbGateway struct {
 	conn   *bbConn // the phone connected now (a new connection replaces it)
 	callID string  // the call whose audio goes to/from the phone
 	muted  atomic.Bool
+
+	agc        *bbAGC // peer -> phone levelling, see bbagc.go
+	upSum      float64
+	upN        int
+	lastReport time.Time
 }
 
 func newBBGateway(sessions *SessionManager, broker *Broker, token, sessionID string, log *slog.Logger) *bbGateway {
@@ -342,7 +348,14 @@ func (g *bbGateway) onAudio(c *bbConn, frame []byte) {
 		return
 	}
 	if ac, ok := sess.reg.get(callID); ok {
-		ac.cm.FeedCapturedPCM(media.PCMInt16LEToFloat32(frame[bbHeaderLen:]))
+		pcm := media.PCMInt16LEToFloat32(frame[bbHeaderLen:])
+		g.mu.Lock()
+		for _, s := range pcm {
+			g.upSum += float64(s) * float64(s)
+		}
+		g.upN += len(pcm)
+		g.mu.Unlock()
+		ac.cm.FeedCapturedPCM(pcm)
 	}
 }
 
@@ -436,6 +449,9 @@ func (g *bbGateway) onControl(c *bbConn, msg map[string]any) {
 func (g *bbGateway) attach(sess *Session, callID string) {
 	g.mu.Lock()
 	g.callID = callID
+	g.agc = newBBAGC()
+	g.upSum, g.upN = 0, 0
+	g.lastReport = time.Now()
 	g.mu.Unlock()
 	g.muted.Store(false)
 	sess.setBridge(callID, &bbBridge{g: g})
@@ -449,6 +465,7 @@ func (b *bbBridge) WritePCM(pcm []float32) error {
 	if c == nil || len(pcm) == 0 {
 		return nil
 	}
+	b.g.levelAndReport(pcm)
 	frame := make([]byte, bbHeaderLen, bbHeaderLen+2*len(pcm))
 	frame[0] = bbKindAudio
 	binary.LittleEndian.PutUint32(frame[4:], c.seq.Add(1))
@@ -459,3 +476,27 @@ func (b *bbBridge) WritePCM(pcm []float32) error {
 }
 
 func (b *bbBridge) Close() {}
+
+// levelAndReport runs the peer audio through the AGC and logs the call's
+// levels every 10 s (peer in/out of the AGC, phone mic) for tuning.
+func (g *bbGateway) levelAndReport(pcm []float32) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.agc == nil {
+		g.agc = newBBAGC()
+		g.lastReport = time.Now()
+	}
+	g.agc.process(pcm)
+	if time.Since(g.lastReport) < 10*time.Second {
+		return
+	}
+	g.lastReport = time.Now()
+	if in, out, gain, ok := g.agc.report(); ok {
+		up := -120.0
+		if g.upN > 0 {
+			up = 10 * math.Log10(g.upSum/float64(g.upN)+1e-12)
+		}
+		g.upSum, g.upN = 0, 0
+		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(up))
+	}
+}
