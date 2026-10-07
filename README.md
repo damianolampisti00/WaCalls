@@ -17,6 +17,8 @@ Built for native VoIP media, multi-account (multi-session) operation, and a mode
 
 ---
 
+> **Fork note:** this fork adds the [Berry Bridge gateway](#berry-bridge-gateway-blackberry-10) for BlackBerry 10 phones. Everything else is upstream WaCalls.
+
 ## Overview
 
 WaCalls pairs one or more WhatsApp accounts via **QR code** and lets you **place and
@@ -216,6 +218,42 @@ calls, and read history. **Run it only on a trusted LAN.** `wacalls.db` holds Wh
 session credentials (secrets): **do not commit it** and keep it protected.
 
 ---
+
+## Berry Bridge gateway (BlackBerry 10)
+
+> This fork adds a second way to take part in calls besides the browser: a
+> **BlackBerry 10 phone** running [Berry Bridge](https://github.com/damianolampisti00/BerryBridge)
+> becomes the audio and UI terminal of the calls of one WhatsApp session.
+> Upstream: [JotaDev66/WaCalls](https://github.com/JotaDev66/WaCalls).
+
+The call core is untouched. `CallManager` already speaks plain 16 kHz PCM
+(`FeedCapturedPCM` up, `OnPeerAudio` down); the browser's WebRTC `Bridge`
+and the new `bbBridge` both implement a small `mediaBridge` interface
+(`cmd/server/callregistry.go`), and the gateway (`cmd/server/bbgateway.go`)
+turns the broker's call events into a simple protocol for the phone:
+
+- **one WebSocket**, `GET /ws` on its **own listener**, authenticated with
+  `Authorization: Bearer <token>`;
+- **JSON text frames** for control: `call.start` / `accept` / `reject` /
+  `hangup` / `mute` from the phone, `hello`, `call.incoming`, `call.state`,
+  `call.ended` from the server (caller numbers resolved from LIDs);
+- **binary frames** for audio both ways: `0x01, flags, 0, 0, seq (u32 LE),
+  sender ms (u32 LE)`, then signed 16-bit LE PCM at 16 kHz mono;
+- a `test.echo` mode that returns the phone's audio as is (transport tests);
+- a boost-only AGC on the peer's voice (`cmd/server/bbagc.go`), and
+  `call levels` in the log every 10 s.
+
+Run it next to the normal API:
+
+```bash
+head -c 32 /dev/urandom | base64 > bb_token        # 16+ characters
+./wacalls -addr 127.0.0.1:8097 -db wacalls.db           -bb-addr 127.0.0.1:8098 -bb-token-file bb_token [-bb-session <id>]
+```
+
+Expose **only** `-bb-addr` to the internet, over HTTPS (a reverse proxy or a
+Cloudflare tunnel; for a long-lived audio stream prefer HTTP/2 transport over
+QUIC). The browser API on `-addr` still has no authentication: keep it on
+localhost. Without `-bb-addr` the server behaves exactly like upstream.
 
 ## Contributors
 
