@@ -228,7 +228,7 @@ func (s *Session) info() SessionInfo {
 	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
 }
 
-func (s *Session) setBridge(callID string, b *Bridge) {
+func (s *Session) setBridge(callID string, b mediaBridge) {
 	oldB, found := s.reg.setBridge(callID, b)
 	if !found {
 		b.Close()

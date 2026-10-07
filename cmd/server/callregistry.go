@@ -6,9 +6,17 @@ import (
 	"wacalls/internal/voip/call"
 )
 
+// mediaBridge carries one call's 16 kHz mono PCM to and from the device of
+// whoever handles it: a browser over WebRTC (Bridge) or a BlackBerry over the
+// Berry Bridge gateway's WebSocket (bbBridge, see bbgateway.go).
+type mediaBridge interface {
+	WritePCM(pcm []float32) error
+	Close()
+}
+
 type activeCall struct {
 	cm     *call.CallManager
-	bridge *Bridge
+	bridge mediaBridge
 }
 
 type callRegistry struct {
@@ -50,7 +58,7 @@ func (r *callRegistry) count() int {
 	return len(r.calls)
 }
 
-func (r *callRegistry) setBridge(callID string, b *Bridge) (*Bridge, bool) {
+func (r *callRegistry) setBridge(callID string, b mediaBridge) (mediaBridge, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ac, ok := r.calls[callID]

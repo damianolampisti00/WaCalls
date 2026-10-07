@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,9 @@ func main() {
 	staticDir := flag.String("static", "client/dist", "static client directory (optional)")
 	debug := flag.Bool("debug", false, "verbose logging")
 	maxCalls := flag.Int("max-calls-per-session", 8, "max concurrent calls per session (0 = unlimited)")
+	bbAddr := flag.String("bb-addr", "", "Berry Bridge gateway listen address (empty = off), see bbgateway.go")
+	bbTokenFile := flag.String("bb-token-file", "", "file holding the Berry Bridge gateway token")
+	bbSession := flag.String("bb-session", "", "session the Berry Bridge phone uses (empty = first paired)")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -50,9 +54,29 @@ func main() {
 		}
 	}()
 
+	var bbSrv *http.Server
+	if *bbAddr != "" {
+		token, err := os.ReadFile(*bbTokenFile)
+		if err != nil || len(strings.TrimSpace(string(token))) < 16 {
+			log.Error("Berry Bridge gateway needs -bb-token-file with a token of 16+ characters", "err", err)
+			os.Exit(1)
+		}
+		gw := newBBGateway(srv.sessions, srv.broker, string(token), *bbSession, log)
+		bbSrv = &http.Server{Addr: *bbAddr, Handler: gw.routes()}
+		go func() {
+			log.Info("Berry Bridge gateway listening", "addr", *bbAddr)
+			if err := bbSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("Berry Bridge gateway error", "err", err)
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if bbSrv != nil {
+		_ = bbSrv.Shutdown(shutdownCtx)
+	}
 }
