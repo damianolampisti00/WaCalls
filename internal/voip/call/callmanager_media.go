@@ -52,6 +52,9 @@ func (m *CallManager) FeedCapturedPCM(data []float32) {
 			continue
 		}
 		m.sendOpusFrameLocked(opus)
+		if m.OnSentPCM != nil {
+			m.OnSentPCM(frame)
+		}
 	}
 }
 
@@ -98,6 +101,9 @@ func (m *CallManager) startSilenceKeepaliveLocked() {
 				if ready && idle {
 					if opus, err := m.codec.Encode(silence); err == nil {
 						m.sendOpusFrameLocked(opus)
+						if m.OnSentPCM != nil {
+							m.OnSentPCM(silence)
+						}
 					}
 				}
 				m.mu.Unlock()

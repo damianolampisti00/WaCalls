@@ -94,6 +94,16 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		_ = ac.bridge.WritePCM(pcm16)
 	}
+	// Bridges that cancel echo (bbBridge) want what was sent to the peer.
+	cm.OnSentPCM = func(pcm16 []float32) {
+		ac, ok := s.reg.get(callID)
+		if !ok || ac.bridge == nil {
+			return
+		}
+		if r, ok := ac.bridge.(interface{ SentPCM([]float32) }); ok {
+			r.SentPCM(pcm16)
+		}
+	}
 }
 
 func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo bool) (string, error) {

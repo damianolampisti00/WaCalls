@@ -83,7 +83,8 @@ type bbGateway struct {
 	callID string  // the call whose audio goes to/from the phone
 	muted  atomic.Bool
 
-	agc        *bbAGC // peer -> phone levelling, see bbagc.go
+	agc        *bbAGC  // peer -> phone levelling, see bbagc.go
+	echo       *bbEcho // the user's voice coming back from a hands-free peer, see bbecho.go
 	upSum      float64
 	upN        int
 	lastReport time.Time
@@ -509,6 +510,10 @@ func (g *bbGateway) attach(sess *Session, callID string) {
 	g.mu.Lock()
 	g.callID = callID
 	g.agc = newBBAGC()
+	if g.echo != nil {
+		g.echo.close()
+	}
+	g.echo = newBBEcho()
 	g.upSum, g.upN = 0, 0
 	g.lastReport = time.Now()
 	g.mu.Unlock()
@@ -523,6 +528,12 @@ func (b *bbBridge) WritePCM(pcm []float32) error {
 	c := b.g.current()
 	if c == nil || len(pcm) == 0 {
 		return nil
+	}
+	b.g.mu.Lock()
+	echo := b.g.echo
+	b.g.mu.Unlock()
+	if echo != nil {
+		echo.process(pcm)
 	}
 	b.g.levelAndReport(pcm)
 	if c.opus.Load() {
@@ -539,6 +550,16 @@ func (b *bbBridge) WritePCM(pcm []float32) error {
 }
 
 func (b *bbBridge) Close() {}
+
+// SentPCM is the call core's audio to the peer: the echo canceller's reference.
+func (b *bbBridge) SentPCM(pcm []float32) {
+	b.g.mu.Lock()
+	echo := b.g.echo
+	b.g.mu.Unlock()
+	if echo != nil {
+		echo.sent(pcm)
+	}
+}
 
 // writeOpus cuts the call core's 60 ms frames into 20 ms Opus packets.
 func (g *bbGateway) writeOpus(c *bbConn, pcm []float32) {
@@ -594,6 +615,11 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 			up = 10 * math.Log10(g.upSum/float64(g.upN)+1e-12)
 		}
 		g.upSum, g.upN = 0, 0
-		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(up))
+		echoLag := -1
+		if g.echo != nil {
+			echoLag = g.echo.lagMs()
+		}
+		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(up),
+			"echo_lag_ms", echoLag)
 	}
 }

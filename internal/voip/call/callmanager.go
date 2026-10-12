@@ -46,6 +46,9 @@ type CallManager struct {
 	OnIncoming    func(*CallInfo)
 	OnEnded       func(*CallInfo)
 	OnPeerAudio   func([]float32)
+	// OnSentPCM gets each frame sent to the peer (captured audio or the
+	// keep-alive silence), in order: an echo canceller's reference.
+	OnSentPCM func([]float32)
 }
 
 func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
