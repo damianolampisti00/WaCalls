@@ -237,8 +237,11 @@ turns the broker's call events into a simple protocol for the phone:
 - **JSON text frames** for control: `call.start` / `accept` / `reject` /
   `hangup` / `mute` from the phone, `hello`, `call.incoming`, `call.state`,
   `call.ended` from the server (caller numbers resolved from LIDs);
-- **binary frames** for audio both ways: `0x01, flags, 0, 0, seq (u32 LE),
-  sender ms (u32 LE)`, then signed 16-bit LE PCM at 16 kHz mono;
+- **binary frames** for audio both ways: `kind, flags, 0, 0, seq (u32 LE),
+  sender ms (u32 LE)`, then signed 16-bit LE PCM at 16 kHz mono (kind `0x01`)
+  or, once the phone asked for `audio.codec: opus`, one 20 ms Opus packet
+  (kind `0x03`, ~24 kbit/s instead of 256: this part needs libopus, through
+  cgo — `pkg-config opus`);
 - a `test.echo` mode that returns the phone's audio as is (transport tests);
 - a boost-only AGC on the peer's voice (`cmd/server/bbagc.go`), and
   `call levels` in the log every 10 s.

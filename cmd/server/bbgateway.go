@@ -29,11 +29,16 @@ package main
 //     {"type":"ping","t":<any>}
 //
 //   Binary frames, audio, both directions:
-//     [0] 0x01  [1] flags (0)  [2:4] reserved
+//     [0] kind: 0x01 PCM, 0x03 Opus  [1] flags (0)  [2:4] reserved
 //     [4:8] sequence number, uint32 LE (per sender, +1 per frame)
 //     [8:12] sender clock in ms, uint32 LE (round-trip measurements)
-//     [12:] PCM, signed 16-bit LE, 16 kHz, mono (any length; the server
-//           sends the codec's 60 ms frames, the phone ~20 ms blocks)
+//     [12:] 0x01: PCM, signed 16-bit LE, 16 kHz, mono (any length; the
+//           server sends the codec's 60 ms frames, the phone ~20 ms blocks)
+//           0x03: one Opus packet, 16 kHz mono, 20 ms (bbopus.go)
+//
+//   Codec: PCM until the phone sends {"type":"audio.codec","codec":"opus"};
+//   the server answers the same message and from then on sends Opus (and
+//   takes both kinds from the phone). ~24 kbit/s a way instead of 256.
 
 import (
 	"context"
@@ -61,6 +66,7 @@ const (
 	bbOwner        = "berrybridge"
 	bbHeaderLen    = 12
 	bbKindAudio    = 0x01
+	bbKindOpus     = 0x03
 	bbQueueFrames  = 64 // writer queue; audio beyond it is dropped, never queued up
 	bbWriteTimeout = 5 * time.Second
 )
@@ -102,6 +108,14 @@ type bbConn struct {
 	seq    atomic.Uint32
 	start  time.Time
 	sub    *subscriber
+
+	// Opus, once the phone asked for it (audio.codec). enc and pending are
+	// used by the call core's writer goroutine, dec by the reader.
+	opus    atomic.Bool
+	codecMu sync.Mutex
+	enc     *bbOpusEncoder
+	dec     *bbOpusDecoder
+	pending []int16
 }
 
 type bbMsg struct {
@@ -159,6 +173,10 @@ func (g *bbGateway) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	cancel()
 	g.broker.unsubscribe(c.sub)
+	c.codecMu.Lock()
+	c.enc.close()
+	c.dec.close()
+	c.codecMu.Unlock()
 	g.mu.Lock()
 	if g.conn == c {
 		g.conn = nil
@@ -327,7 +345,7 @@ func (g *bbGateway) reader(c *bbConn) {
 }
 
 func (g *bbGateway) onAudio(c *bbConn, frame []byte) {
-	if len(frame) < bbHeaderLen || frame[0] != bbKindAudio {
+	if len(frame) < bbHeaderLen || (frame[0] != bbKindAudio && frame[0] != bbKindOpus) {
 		return
 	}
 	if c.echo.Load() {
@@ -348,7 +366,25 @@ func (g *bbGateway) onAudio(c *bbConn, frame []byte) {
 		return
 	}
 	if ac, ok := sess.reg.get(callID); ok {
-		pcm := media.PCMInt16LEToFloat32(frame[bbHeaderLen:])
+		var pcm []float32
+		if frame[0] == bbKindOpus {
+			c.codecMu.Lock()
+			dec := c.dec
+			var samples []int16
+			if dec != nil {
+				samples, err = dec.decode(frame[bbHeaderLen:])
+			}
+			c.codecMu.Unlock()
+			if dec == nil || err != nil {
+				return
+			}
+			pcm = make([]float32, len(samples))
+			for i, v := range samples {
+				pcm[i] = float32(v) / 32768
+			}
+		} else {
+			pcm = media.PCMInt16LEToFloat32(frame[bbHeaderLen:])
+		}
 		g.mu.Lock()
 		for _, s := range pcm {
 			g.upSum += float64(s) * float64(s)
@@ -368,6 +404,29 @@ func (g *bbGateway) onControl(c *bbConn, msg map[string]any) {
 	switch typ {
 	case "ping":
 		c.sendJSON(map[string]any{"type": "pong", "t": msg["t"]})
+	case "audio.codec":
+		if str("codec") != "opus" {
+			c.opus.Store(false)
+			c.sendJSON(map[string]any{"type": "audio.codec", "codec": "pcm"})
+			return
+		}
+		c.codecMu.Lock()
+		var err error
+		if c.enc == nil {
+			c.enc, err = newBBOpusEncoder()
+		}
+		if err == nil && c.dec == nil {
+			c.dec, err = newBBOpusDecoder()
+		}
+		c.codecMu.Unlock()
+		if err != nil {
+			g.log.Warn("opus unavailable, staying on PCM", "err", err)
+			c.sendJSON(map[string]any{"type": "audio.codec", "codec": "pcm"})
+			return
+		}
+		c.opus.Store(true)
+		g.log.Info("phone audio codec", "codec", "opus")
+		c.sendJSON(map[string]any{"type": "audio.codec", "codec": "opus"})
 	case "test.echo":
 		on, _ := msg["on"].(bool)
 		c.echo.Store(on)
@@ -466,6 +525,10 @@ func (b *bbBridge) WritePCM(pcm []float32) error {
 		return nil
 	}
 	b.g.levelAndReport(pcm)
+	if c.opus.Load() {
+		b.g.writeOpus(c, pcm)
+		return nil
+	}
 	frame := make([]byte, bbHeaderLen, bbHeaderLen+2*len(pcm))
 	frame[0] = bbKindAudio
 	binary.LittleEndian.PutUint32(frame[4:], c.seq.Add(1))
@@ -476,6 +539,40 @@ func (b *bbBridge) WritePCM(pcm []float32) error {
 }
 
 func (b *bbBridge) Close() {}
+
+// writeOpus cuts the call core's 60 ms frames into 20 ms Opus packets.
+func (g *bbGateway) writeOpus(c *bbConn, pcm []float32) {
+	c.codecMu.Lock()
+	defer c.codecMu.Unlock()
+	if c.enc == nil {
+		return
+	}
+	for _, s := range pcm {
+		v := s * 32768
+		if v > 32767 {
+			v = 32767
+		} else if v < -32768 {
+			v = -32768
+		}
+		c.pending = append(c.pending, int16(v))
+	}
+	for len(c.pending) >= bbOpusFrame {
+		frame := make([]byte, bbHeaderLen, bbHeaderLen+128)
+		frame[0] = bbKindOpus
+		binary.LittleEndian.PutUint32(frame[4:], c.seq.Add(1))
+		binary.LittleEndian.PutUint32(frame[8:], uint32(time.Since(c.start).Milliseconds()))
+		var err error
+		frame, err = c.enc.encode(c.pending[:bbOpusFrame], frame)
+		c.pending = c.pending[bbOpusFrame:]
+		if err != nil {
+			continue
+		}
+		c.enqueue(bbMsg{websocket.MessageBinary, frame})
+	}
+	if len(c.pending) == 0 {
+		c.pending = nil // let the backing array go
+	}
+}
 
 // levelAndReport runs the peer audio through the AGC and logs the call's
 // levels every 10 s (peer in/out of the AGC, phone mic) for tuning.
