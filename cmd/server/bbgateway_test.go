@@ -145,3 +145,22 @@ func TestBBAGCBoostsQuietSpeechAndHoldsSilence(t *testing.T) {
 		}
 	}
 }
+
+func TestBBAGCUplinkAimsAtCallLevel(t *testing.T) {
+	a := newBBAGCTarget(agcUpTarget)
+	f := make([]float32, 960)
+	for i := 0; i < 200; i++ { // the Q5 mic: speech around -36 dBFS
+		for j := range f {
+			f[j] = 0.0158
+			if j%2 == 1 {
+				f[j] = -0.0158
+			}
+		}
+		a.process(f)
+	}
+	// -36 -> -20 dBFS is +16 dB, a gain of ~6.3 (and no more: aiming lower
+	// than the downlink, the mic is not pushed to the limiter).
+	if a.gain < 5.5 || a.gain > 7 {
+		t.Fatalf("uplink gain %.2f, want ~6.3", a.gain)
+	}
+}
