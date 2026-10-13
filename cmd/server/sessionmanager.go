@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -112,11 +114,41 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		m.register(s)
 		if err := s.connect(ctx); err != nil {
 			m.log.Error("session connect failed", "session", row.ID, "err", err)
+			if s.client.Store.ID != nil {
+				go m.retryConnect(s)
+			}
 		}
 	}
 	m.broker.emitSessionList(m.infos())
 	m.log.Info("sessions restored", "count", len(m.infos()))
 	return nil
+}
+
+// retryConnect keeps connecting a restored session whose first attempt
+// failed. whatsmeow reconnects by itself only once it has been connected, so
+// a failure at boot (network not up yet) left the session offline for good:
+// no calls until the server was restarted by hand.
+func (m *SessionManager) retryConnect(s *Session) {
+	delay := 5 * time.Second
+	for {
+		select {
+		case <-m.appCtx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if cur, ok := m.Get(s.id); !ok || cur != s || s.client.IsConnected() {
+			return
+		}
+		err := s.client.Connect()
+		if err == nil || errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			m.log.Info("session connected after retry", "session", s.id)
+			return
+		}
+		if delay < time.Minute {
+			delay *= 2
+		}
+		m.log.Warn("session connect retry failed", "session", s.id, "err", err, "next", delay)
+	}
 }
 
 func (m *SessionManager) Create(name string) (string, error) {

@@ -124,10 +124,19 @@ func (s *Session) callForEvent(from types.JID, data *waBinary.Node) (*activeCall
 	return s.reg.get(callID)
 }
 
+// WhatsApp rings for about a minute; an offer older than this is over.
+const staleOfferAge = 45 * time.Second
+
 func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 	node := wrapCall(evt.From, evt.Data)
 	callID := callIDFromNode(node)
 	if callID == "" {
+		return
+	}
+	// Offers queued while the session was offline are delivered on connect,
+	// minutes or hours late: the caller has long given up, so don't ring.
+	if !evt.Timestamp.IsZero() && time.Since(evt.Timestamp) > staleOfferAge {
+		s.log.Info("ignoring a stale call offer", "call_id", callID, "age", time.Since(evt.Timestamp).Round(time.Second))
 		return
 	}
 	if max := s.mgr.maxCalls; max > 0 && s.reg.count() >= max {
