@@ -83,13 +83,21 @@ type bbGateway struct {
 	callID string  // the call whose audio goes to/from the phone
 	muted  atomic.Bool
 
-	agc        *bbAGC    // peer -> phone levelling, see bbagc.go
-	echo       *bbEcho   // the user's voice coming back from a hands-free peer, see bbecho.go
-	upAgc      *bbAGC    // phone mic -> peer levelling
-	upEcho     *bbUpEcho // the phone's own loudspeaker in its mic, see bbupecho.go
-	upRawSum   float64   // mic level before the canceller, for the report
-	upRawN     int
-	lastReport time.Time
+	agc      *bbAGC    // peer -> phone levelling, see bbagc.go
+	echo     *bbEcho   // the user's voice coming back from a hands-free peer, see bbecho.go
+	upAgc    *bbAGC    // phone mic -> peer levelling
+	upEcho   *bbUpEcho // the phone's own loudspeaker in its mic, see bbupecho.go
+	upRawSum float64   // mic level before the canceller, for the report
+	upRawN   int
+	// Uplink timing since the last report: mic frames arriving more than
+	// 80 ms after the previous one (the phone sends every 20 ms), the
+	// longest gap, and silence the call core sent because no mic audio
+	// came for 120 ms. Any of these is a gap the peer hears.
+	upLastAt    time.Time
+	upLate      int
+	upMaxGap    time.Duration
+	upKeepalive int
+	lastReport  time.Time
 }
 
 func newBBGateway(sessions *SessionManager, broker *Broker, token, sessionID string, log *slog.Logger) *bbGateway {
@@ -392,6 +400,17 @@ func (g *bbGateway) onAudio(c *bbConn, frame []byte) {
 			pcm = media.PCMInt16LEToFloat32(frame[bbHeaderLen:])
 		}
 		g.mu.Lock()
+		now := time.Now()
+		if !g.upLastAt.IsZero() {
+			gap := now.Sub(g.upLastAt)
+			if gap > 80*time.Millisecond {
+				g.upLate++
+			}
+			if gap > g.upMaxGap {
+				g.upMaxGap = gap
+			}
+		}
+		g.upLastAt = now
 		for _, s := range pcm {
 			g.upRawSum += float64(s) * float64(s)
 		}
@@ -536,6 +555,7 @@ func (g *bbGateway) attach(sess *Session, callID string) {
 	g.upEcho = newBBUpEcho()
 	g.upAgc = newBBAGCUp()
 	g.upRawSum, g.upRawN = 0, 0
+	g.upLastAt, g.upLate, g.upMaxGap, g.upKeepalive = time.Time{}, 0, 0, 0
 	g.lastReport = time.Now()
 	g.mu.Unlock()
 	g.muted.Store(false)
@@ -582,10 +602,22 @@ func (b *bbBridge) Close() {}
 func (b *bbBridge) SentPCM(pcm []float32) {
 	b.g.mu.Lock()
 	echo := b.g.echo
+	if isSilence(pcm) {
+		b.g.upKeepalive++
+	}
 	b.g.mu.Unlock()
 	if echo != nil {
 		echo.sent(pcm)
 	}
+}
+
+func isSilence(pcm []float32) bool {
+	for _, s := range pcm {
+		if s != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // writeOpus cuts the call core's 60 ms frames into 20 ms Opus packets.
@@ -647,6 +679,7 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 				up, toPeer, micGain = i, o, gn
 			}
 		}
+		defer func() { g.upLate, g.upMaxGap, g.upKeepalive = 0, 0, 0 }()
 		upLag, upFrames, upCorr := -1, 0, 0.0
 		if g.upEcho != nil {
 			upLag = g.upEcho.lagMs()
@@ -659,6 +692,7 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(raw),
 			"mic_after_aec_dbfs", int(up), "to_peer_dbfs", int(toPeer), "mic_agc_db", int(micGain),
 			"phone_echo_lag_ms", upLag, "phone_echo_corr", math.Round(upCorr*100)/100, "pos_frames", upFrames,
+			"mic_late", g.upLate, "mic_max_gap_ms", g.upMaxGap.Milliseconds(), "keepalive_frames", g.upKeepalive,
 			"echo_lag_ms", echoLag)
 	}
 }
