@@ -226,8 +226,9 @@ session credentials (secrets): **do not commit it** and keep it protected.
 > becomes the audio and UI terminal of the calls of one WhatsApp session.
 > Upstream: [JotaDev66/WaCalls](https://github.com/JotaDev66/WaCalls).
 
-The call core is untouched. `CallManager` already speaks plain 16 kHz PCM
-(`FeedCapturedPCM` up, `OnPeerAudio` down); the browser's WebRTC `Bridge`
+The call core is nearly untouched: `CallManager` already speaks plain 16 kHz
+PCM (`FeedCapturedPCM` up, `OnPeerAudio` down) and only gained an
+`OnSentPCM` hook (the audio actually sent, for echo cancelling); the browser's WebRTC `Bridge`
 and the new `bbBridge` both implement a small `mediaBridge` interface
 (`cmd/server/callregistry.go`), and the gateway (`cmd/server/bbgateway.go`)
 turns the broker's call events into a simple protocol for the phone:
@@ -243,8 +244,27 @@ turns the broker's call events into a simple protocol for the phone:
   (kind `0x03`, ~24 kbit/s instead of 256: this part needs libopus, through
   cgo — `pkg-config opus`);
 - a `test.echo` mode that returns the phone's audio as is (transport tests);
-- a boost-only AGC on the peer's voice (`cmd/server/bbagc.go`), and
-  `call levels` in the log every 10 s.
+- **echo cancelling** with WebRTC's AEC3 (`bbaec.cpp`, through cgo —
+  `pkg-config webrtc-audio-processing-1`), both ways:
+  - the phone's own earpiece/speaker in its mic (`bbupecho.go`): with flag
+    `0x01` the phone puts its playback position (downlink samples played,
+    mod 65536) in bytes 2-3 of each mic frame, so the reference is exactly
+    what it played, pauses and jitter-buffer refills included;
+  - the user's voice coming back from a hands-free peer (`bbecho.go`), the
+    round trip found by an envelope search;
+- boost-only AGCs (`bbagc.go`) on the peer's voice and, after the echo
+  canceller, on the phone's mic (capped at +12 dB);
+- a **pacer** for the mic (`bbuppacer.go`): mobile links deliver it in
+  bursts after stalls of up to a second; a 100 ms buffer feeds the call one
+  20 ms frame per tick, silence while it refills, and cuts a backlog over
+  300 ms back, so the peer hears neither jumps nor crackles;
+- `call levels` in the log every 10 s (levels, echo canceller, mic timing).
+
+Two fixes outside the gateway: a session whose first connect fails at boot
+(network not up yet) is retried with a backoff, since whatsmeow only
+reconnects after a successful connection; and call offers older than 45 s,
+which WhatsApp delivers on connect after an outage, are ignored instead of
+ringing.
 
 Run it next to the normal API:
 
