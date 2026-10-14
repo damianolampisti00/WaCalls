@@ -40,6 +40,7 @@ func newBBUpEcho() *bbUpEcho {
 	e.aligned = true
 	e.lead = bbUpEchoLead
 	e.hasLag = true // lag 0 until the search finds the real one
+	e.provisional = true
 	return &bbUpEcho{echo: e}
 }
 

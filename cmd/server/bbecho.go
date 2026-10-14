@@ -32,6 +32,7 @@ const (
 	bbEchoBlock     = 320 // envelope block for the lag search: 20 ms
 	bbEchoRefKeep   = 4 * bbEchoRate
 	bbEchoEnvBlocks = 400  // 8 s of envelope
+	bbEchoMinBlocks = 150  // 3 s: the shortest window searched
 	bbEchoMinLag    = -50  // blocks (-1 s): the streams start at different moments
 	bbEchoMaxLag    = 150  // blocks (+3 s)
 	bbEchoLead      = 1600 // samples (100 ms) the reference is fed ahead of the estimate
@@ -59,6 +60,9 @@ type bbEcho struct {
 	hasLag bool
 	cand   int64   // a new lag seen once, confirmed by the next estimate
 	corr   float64 // the best correlation of the last estimate (for the log)
+	// provisional: the lag is a starting guess (bbupecho.go), so the first
+	// clear estimate replaces it at once instead of needing a confirmation.
+	provisional bool
 
 	lead int64 // samples the reference is fed ahead of the estimated echo
 	// aligned: reference and capture arrive in lockstep (bbupecho.go), so
@@ -191,7 +195,12 @@ func (e *bbEcho) process(pcm []float32) {
 // follows the sent one, over the last 8 s. Only a clear peak counts (the
 // user talked and the echo came back); a change needs two estimates.
 func (e *bbEcho) estimate() {
-	n := bbEchoEnvBlocks
+	// The full 8 s window once there is that much; from 3 s on, what there
+	// is, so the echo of a short call gets cancelled too.
+	n := min(bbEchoEnvBlocks, len(e.capEnv))
+	if n < bbEchoMinBlocks {
+		return
+	}
 	capEnd := e.capEnvAt + int64(len(e.capEnv))
 	capFrom := capEnd - int64(n)
 	if capFrom < e.capEnvAt {
@@ -228,8 +237,8 @@ func (e *bbEcho) estimate() {
 	}
 	lag := bestLag * bbEchoBlock
 	switch {
-	case !e.hasLag:
-		e.lag, e.hasLag = lag, true
+	case !e.hasLag || e.provisional:
+		e.lag, e.hasLag, e.provisional = lag, true, false
 	case lag == e.lag:
 		e.cand = 0
 	case lag == e.cand:

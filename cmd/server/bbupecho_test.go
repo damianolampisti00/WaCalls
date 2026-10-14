@@ -13,16 +13,36 @@ import (
 // room response, plus the user talking now and then. Each mic frame reports
 // the playback position. The echo must be cut by at least 10 dB.
 func TestBBUpEchoCancels(t *testing.T) {
+	erle, lag := upEchoERLE(2, 40, 960, 1, 25) // handset: 60 ms, a weak echo
+	t.Logf("lag %d ms, echo reduced by %.1f dB", lag, erle)
+	if erle < 10 {
+		t.Fatalf("echo reduced by only %.1f dB", erle)
+	}
+}
+
+// A short call on the loudspeaker: the echo as loud as the playback, 300 ms
+// later; it must be cut from the first seconds on.
+func TestBBUpEchoShortLoudCall(t *testing.T) {
+	erle, lag := upEchoERLE(3, 20, 4800, 3, 8)
+	t.Logf("lag %d ms, echo reduced by %.1f dB", lag, erle)
+	if erle < 10 {
+		t.Fatalf("echo reduced by only %.1f dB", erle)
+	}
+}
+
+// upEchoERLE simulates seconds of call (devLat samples from playback to the
+// mic, the room response scaled by gain) and returns the echo reduction
+// measured from fromSec on, and the lag found.
+func upEchoERLE(seed int64, seconds, devLat int, gain float64, fromSec int) (float64, int) {
 	u := newBBUpEcho()
 	defer u.close()
-	rng := rand.New(rand.NewSource(2))
+	rng := rand.New(rand.NewSource(seed))
 
-	const total = 40 * bbEchoRate
+	total := seconds * bbEchoRate
 	const frame = 320 // the phone's 20 ms mic frames
 	const gwFrame = 960
 	const cushion = 1920 // 120 ms
-	const devLat = 960   // 60 ms from playback to the mic
-	room := []float64{0.3, 0.15, -0.08, 0.04}
+	room := []float64{0.3 * gain, 0.15 * gain, -0.08 * gain, 0.04 * gain}
 
 	// The peer's audio: talk spurts and silences, as the gateway sends it.
 	var peer []float32
@@ -111,7 +131,7 @@ func TestBBUpEchoCancels(t *testing.T) {
 		}
 		in := append([]float32(nil), mic...)
 		u.mic(mic, uint16(taken))
-		if clock > 25*bbEchoRate {
+		if clock > fromSec*bbEchoRate {
 			for i := range mic {
 				if echoOnly[i] {
 					echoIn += float64(in[i]) * float64(in[i])
@@ -120,9 +140,5 @@ func TestBBUpEchoCancels(t *testing.T) {
 			}
 		}
 	}
-	erle := 10 * math.Log10(echoIn/(echoOut+1e-12))
-	t.Logf("lag %d ms, echo reduced by %.1f dB", u.lagMs(), erle)
-	if erle < 10 {
-		t.Fatalf("echo reduced by only %.1f dB", erle)
-	}
+	return 10 * math.Log10(echoIn/(echoOut+1e-12)), u.lagMs()
 }

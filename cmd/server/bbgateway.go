@@ -97,7 +97,12 @@ type bbGateway struct {
 	upLate      int
 	upMaxGap    time.Duration
 	upKeepalive int
-	lastReport  time.Time
+	// The phone's send clock (header [8:12]): a long gap there means the
+	// phone itself sent late; gaps only in arrival happen on the way.
+	upLastTs     uint32
+	upHasTs      bool
+	upMaxSendGap uint32
+	lastReport   time.Time
 }
 
 func newBBGateway(sessions *SessionManager, broker *Broker, token, sessionID string, log *slog.Logger) *bbGateway {
@@ -411,6 +416,14 @@ func (g *bbGateway) onAudio(c *bbConn, frame []byte) {
 			}
 		}
 		g.upLastAt = now
+		if ts := binary.LittleEndian.Uint32(frame[8:12]); g.upHasTs {
+			if d := ts - g.upLastTs; d < 60000 && d > g.upMaxSendGap {
+				g.upMaxSendGap = d
+			}
+			g.upLastTs = ts
+		} else {
+			g.upLastTs, g.upHasTs = ts, true
+		}
 		for _, s := range pcm {
 			g.upRawSum += float64(s) * float64(s)
 		}
@@ -556,6 +569,7 @@ func (g *bbGateway) attach(sess *Session, callID string) {
 	g.upAgc = newBBAGCUp()
 	g.upRawSum, g.upRawN = 0, 0
 	g.upLastAt, g.upLate, g.upMaxGap, g.upKeepalive = time.Time{}, 0, 0, 0
+	g.upHasTs, g.upMaxSendGap = false, 0
 	g.lastReport = time.Now()
 	g.mu.Unlock()
 	g.muted.Store(false)
@@ -679,7 +693,7 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 				up, toPeer, micGain = i, o, gn
 			}
 		}
-		defer func() { g.upLate, g.upMaxGap, g.upKeepalive = 0, 0, 0 }()
+		defer func() { g.upLate, g.upMaxGap, g.upKeepalive, g.upMaxSendGap = 0, 0, 0, 0 }()
 		upLag, upFrames, upCorr := -1, 0, 0.0
 		if g.upEcho != nil {
 			upLag = g.upEcho.lagMs()
@@ -692,7 +706,7 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(raw),
 			"mic_after_aec_dbfs", int(up), "to_peer_dbfs", int(toPeer), "mic_agc_db", int(micGain),
 			"phone_echo_lag_ms", upLag, "phone_echo_corr", math.Round(upCorr*100)/100, "pos_frames", upFrames,
-			"mic_late", g.upLate, "mic_max_gap_ms", g.upMaxGap.Milliseconds(), "keepalive_frames", g.upKeepalive,
+			"mic_late", g.upLate, "mic_max_gap_ms", g.upMaxGap.Milliseconds(), "phone_send_max_gap_ms", g.upMaxSendGap, "keepalive_frames", g.upKeepalive,
 			"echo_lag_ms", echoLag)
 	}
 }
