@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -82,9 +83,12 @@ type bbGateway struct {
 	callID string  // the call whose audio goes to/from the phone
 	muted  atomic.Bool
 
-	agc        *bbAGC  // peer -> phone levelling, see bbagc.go
-	echo       *bbEcho // the user's voice coming back from a hands-free peer, see bbecho.go
-	upAgc      *bbAGC  // phone mic -> peer levelling
+	agc        *bbAGC    // peer -> phone levelling, see bbagc.go
+	echo       *bbEcho   // the user's voice coming back from a hands-free peer, see bbecho.go
+	upAgc      *bbAGC    // phone mic -> peer levelling
+	upEcho     *bbUpEcho // the phone's own loudspeaker in its mic, see bbupecho.go
+	upRawSum   float64   // mic level before the canceller, for the report
+	upRawN     int
 	lastReport time.Time
 }
 
@@ -157,6 +161,9 @@ func (g *bbGateway) handleWS(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	old := g.conn
 	g.conn = c
+	if g.upEcho != nil {
+		g.upEcho.resync() // mid-call: audio sent to the old connection was lost
+	}
 	g.mu.Unlock()
 	if old != nil {
 		old.cancel()
@@ -385,8 +392,19 @@ func (g *bbGateway) onAudio(c *bbConn, frame []byte) {
 			pcm = media.PCMInt16LEToFloat32(frame[bbHeaderLen:])
 		}
 		g.mu.Lock()
+		for _, s := range pcm {
+			g.upRawSum += float64(s) * float64(s)
+		}
+		g.upRawN += len(pcm)
+		upEcho := g.upEcho
+		g.mu.Unlock()
+		// Flag 0x01: [2:4] holds the phone's playback position.
+		if upEcho != nil && frame[1]&0x01 != 0 {
+			upEcho.mic(pcm, binary.LittleEndian.Uint16(frame[2:4]))
+		}
+		g.mu.Lock()
 		if g.upAgc == nil {
-			g.upAgc = newBBAGCTarget(agcUpTarget)
+			g.upAgc = newBBAGCUp()
 		}
 		g.upAgc.process(pcm)
 		g.mu.Unlock()
@@ -512,7 +530,12 @@ func (g *bbGateway) attach(sess *Session, callID string) {
 		g.echo.close()
 	}
 	g.echo = newBBEcho()
-	g.upAgc = newBBAGCTarget(agcUpTarget)
+	if g.upEcho != nil {
+		g.upEcho.close()
+	}
+	g.upEcho = newBBUpEcho()
+	g.upAgc = newBBAGCUp()
+	g.upRawSum, g.upRawN = 0, 0
 	g.lastReport = time.Now()
 	g.mu.Unlock()
 	g.muted.Store(false)
@@ -534,6 +557,12 @@ func (b *bbBridge) WritePCM(pcm []float32) error {
 		echo.process(pcm)
 	}
 	b.g.levelAndReport(pcm)
+	b.g.mu.Lock()
+	upEcho := b.g.upEcho
+	b.g.mu.Unlock()
+	if upEcho != nil {
+		upEcho.toPhone(pcm) // as sent: the canceller's reference
+	}
 	if c.opus.Load() {
 		b.g.writeOpus(c, pcm)
 		return nil
@@ -608,18 +637,27 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 	}
 	g.lastReport = time.Now()
 	if in, out, gain, ok := g.agc.report(); ok {
-		up, toPeer, micGain := -120.0, -120.0, 0.0
+		raw, up, toPeer, micGain := -120.0, -120.0, -120.0, 0.0
+		if g.upRawN > 0 {
+			raw = 10 * math.Log10(g.upRawSum/float64(g.upRawN)+1e-12)
+		}
+		g.upRawSum, g.upRawN = 0, 0
 		if g.upAgc != nil {
 			if i, o, gn, ok := g.upAgc.report(); ok {
 				up, toPeer, micGain = i, o, gn
 			}
 		}
+		upLag := -1
+		if g.upEcho != nil {
+			upLag = g.upEcho.lagMs()
+		}
 		echoLag := -1
 		if g.echo != nil {
 			echoLag = g.echo.lagMs()
 		}
-		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(up),
-			"to_peer_dbfs", int(toPeer), "mic_agc_db", int(micGain),
+		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(raw),
+			"mic_after_aec_dbfs", int(up), "to_peer_dbfs", int(toPeer), "mic_agc_db", int(micGain),
+			"phone_echo_lag_ms", upLag,
 			"echo_lag_ms", echoLag)
 	}
 }

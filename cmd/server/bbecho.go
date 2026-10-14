@@ -58,10 +58,16 @@ type bbEcho struct {
 	lag    int64 // capture index c holds the echo of reference index c-lag
 	hasLag bool
 	cand   int64 // a new lag seen once, confirmed by the next estimate
+
+	lead int64 // samples the reference is fed ahead of the estimated echo
+	// aligned: reference and capture arrive in lockstep (bbupecho.go), so
+	// no reference exists past the current capture frame: never feed later
+	// than that.
+	aligned bool
 }
 
 func newBBEcho() *bbEcho {
-	e := &bbEcho{aec: C.bb_aec_new(bbEchoRate)}
+	e := &bbEcho{aec: C.bb_aec_new(bbEchoRate), lead: bbEchoLead}
 	return e
 }
 
@@ -142,7 +148,10 @@ func (e *bbEcho) process(pcm []float32) {
 		}
 		if e.hasLag {
 			// The reference this chunk's echo is made of, bbEchoLead early.
-			r0 := e.capCount - e.lag + bbEchoLead
+			r0 := e.capCount - e.lag + e.lead
+			if last := e.refEnd - bbEchoChunk; e.aligned && r0 > last {
+				r0 = last
+			}
 			for i := 0; i < bbEchoChunk; i++ {
 				idx := r0 + int64(i) - e.refStart
 				if idx >= 0 && idx < int64(len(e.ref)) {

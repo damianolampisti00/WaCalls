@@ -13,9 +13,10 @@ import "math"
 // the Q5's mic arrives around -40 dBFS and peers said the user was hard to
 // hear. That one aims lower (agcUpTarget), at a normal call level.
 type bbAGC struct {
-	target float64 // RMS the speech is brought up to
-	gain   float64 // current linear gain
-	level  float64 // smoothed RMS of the input
+	target  float64 // RMS the speech is brought up to
+	maxGain float64
+	gain    float64 // current linear gain
+	level   float64 // smoothed RMS of the input
 
 	// stats since the last report
 	inSum, outSum float64
@@ -23,19 +24,29 @@ type bbAGC struct {
 }
 
 const (
-	agcTarget   = 0.20       // ~ -14 dBFS RMS: loud, with room for peaks
-	agcUpTarget = 0.10       // ~ -20 dBFS RMS: the mic towards the peer
-	agcMaxGain  = 8.0        // +18 dB
-	agcGate     = 0.004      // ~ -48 dBFS: below this, hold the gain
-	agcAttack   = 0.5        // per frame, when the level rises
-	agcRelease  = 0.05       // per frame, when it falls
-	agcGainUp   = 1.0 + 0.05 // max gain increase per 60 ms frame (~+0.4 dB)
+	agcTarget    = 0.20       // ~ -14 dBFS RMS: loud, with room for peaks
+	agcUpTarget  = 0.10       // ~ -20 dBFS RMS: the mic towards the peer
+	agcUpMaxGain = 4.0        // +12 dB: the mic, after the echo canceller
+	agcMaxGain   = 8.0        // +18 dB
+	agcGate      = 0.004      // ~ -48 dBFS: below this, hold the gain
+	agcAttack    = 0.5        // per frame, when the level rises
+	agcRelease   = 0.05       // per frame, when it falls
+	agcGainUp    = 1.0 + 0.05 // max gain increase per 60 ms frame (~+0.4 dB)
 )
 
 func newBBAGC() *bbAGC { return newBBAGCTarget(agcTarget) }
 
 func newBBAGCTarget(target float64) *bbAGC {
-	return &bbAGC{target: target, gain: 1, level: target}
+	return &bbAGC{target: target, maxGain: agcMaxGain, gain: 1, level: target}
+}
+
+// newBBAGCUp levels the phone's mic, after its echo was cancelled: aiming
+// lower and boosting less (+12 dB), so what the canceller leaves of the
+// echo isn't pushed back up to the peer.
+func newBBAGCUp() *bbAGC {
+	a := newBBAGCTarget(agcUpTarget)
+	a.maxGain = agcUpMaxGain
+	return a
 }
 
 func (a *bbAGC) process(pcm []float32) {
@@ -55,7 +66,7 @@ func (a *bbAGC) process(pcm []float32) {
 		} else {
 			a.level += (rms - a.level) * agcRelease
 		}
-		want := math.Min(agcMaxGain, math.Max(1, a.target/a.level))
+		want := math.Min(a.maxGain, math.Max(1, a.target/a.level))
 		if want > a.gain {
 			a.gain = math.Min(want, a.gain*agcGainUp)
 		} else {
