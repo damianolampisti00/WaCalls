@@ -83,11 +83,12 @@ type bbGateway struct {
 	callID string  // the call whose audio goes to/from the phone
 	muted  atomic.Bool
 
-	agc      *bbAGC    // peer -> phone levelling, see bbagc.go
-	echo     *bbEcho   // the user's voice coming back from a hands-free peer, see bbecho.go
-	upAgc    *bbAGC    // phone mic -> peer levelling
-	upEcho   *bbUpEcho // the phone's own loudspeaker in its mic, see bbupecho.go
-	upRawSum float64   // mic level before the canceller, for the report
+	agc      *bbAGC     // peer -> phone levelling, see bbagc.go
+	echo     *bbEcho    // the user's voice coming back from a hands-free peer, see bbecho.go
+	upAgc    *bbAGC     // phone mic -> peer levelling
+	upEcho   *bbUpEcho  // the phone's own loudspeaker in its mic, see bbupecho.go
+	upPacer  *bbUpPacer // the mic to the call at a steady pace, see bbuppacer.go
+	upRawSum float64    // mic level before the canceller, for the report
 	upRawN   int
 	// Uplink timing since the last report: mic frames arriving more than
 	// 80 ms after the previous one (the phone sends every 20 ms), the
@@ -338,6 +339,10 @@ func (g *bbGateway) forwardEvents(c *bbConn) {
 			g.mu.Lock()
 			if g.callID == id {
 				g.callID = ""
+				if g.upPacer != nil {
+					g.upPacer.close()
+					g.upPacer = nil
+				}
 			}
 			g.mu.Unlock()
 			c.sendJSON(map[string]any{"type": "call.ended", "callId": id, "reason": ev["reason"]})
@@ -439,7 +444,29 @@ func (g *bbGateway) onAudio(c *bbConn, frame []byte) {
 			g.upAgc = newBBAGCUp()
 		}
 		g.upAgc.process(pcm)
+		pacer := g.upPacer
 		g.mu.Unlock()
+		if pacer != nil {
+			pacer.push(pcm)
+		} else {
+			ac.cm.FeedCapturedPCM(pcm)
+		}
+	}
+}
+
+// feedCall gives a frame of mic audio (or silence) to the current call.
+func (g *bbGateway) feedCall(pcm []float32) {
+	g.mu.Lock()
+	callID := g.callID
+	g.mu.Unlock()
+	if callID == "" {
+		return
+	}
+	sess, err := g.session()
+	if err != nil {
+		return
+	}
+	if ac, ok := sess.reg.get(callID); ok {
 		ac.cm.FeedCapturedPCM(pcm)
 	}
 }
@@ -566,6 +593,10 @@ func (g *bbGateway) attach(sess *Session, callID string) {
 		g.upEcho.close()
 	}
 	g.upEcho = newBBUpEcho()
+	if g.upPacer != nil {
+		g.upPacer.close()
+	}
+	g.upPacer = newBBUpPacer(g.feedCall)
 	g.upAgc = newBBAGCUp()
 	g.upRawSum, g.upRawN = 0, 0
 	g.upLastAt, g.upLate, g.upMaxGap, g.upKeepalive = time.Time{}, 0, 0, 0
@@ -694,6 +725,10 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 			}
 		}
 		defer func() { g.upLate, g.upMaxGap, g.upKeepalive, g.upMaxSendGap = 0, 0, 0, 0 }()
+		pacerRebuf, pacerDropMs, pacerBufMs := 0, 0, 0
+		if g.upPacer != nil {
+			pacerRebuf, pacerDropMs, pacerBufMs = g.upPacer.report()
+		}
 		upLag, upFrames, upCorr := -1, 0, 0.0
 		if g.upEcho != nil {
 			upLag = g.upEcho.lagMs()
@@ -706,7 +741,8 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(raw),
 			"mic_after_aec_dbfs", int(up), "to_peer_dbfs", int(toPeer), "mic_agc_db", int(micGain),
 			"phone_echo_lag_ms", upLag, "phone_echo_corr", math.Round(upCorr*100)/100, "pos_frames", upFrames,
-			"mic_late", g.upLate, "mic_max_gap_ms", g.upMaxGap.Milliseconds(), "phone_send_max_gap_ms", g.upMaxSendGap, "keepalive_frames", g.upKeepalive,
+			"mic_late", g.upLate, "mic_max_gap_ms", g.upMaxGap.Milliseconds(), "phone_send_max_gap_ms", g.upMaxSendGap, "silent_frames", g.upKeepalive,
+			"pacer_rebuf", pacerRebuf, "pacer_dropped_ms", pacerDropMs, "pacer_buffered_ms", pacerBufMs,
 			"echo_lag_ms", echoLag)
 	}
 }

@@ -28,6 +28,8 @@ type bbUpEcho struct {
 	pos    int64  // playback position at the previous mic frame, in hist's index
 	pos16  uint16 // as the phone reported it
 	frames int    // mic frames with a position since the last report
+
+	resynced bool // the phone reconnected during the call
 }
 
 const (
@@ -39,14 +41,20 @@ func newBBUpEcho() *bbUpEcho {
 	e := newBBEcho()
 	e.aligned = true
 	e.lead = bbUpEchoLead
-	e.hasLag = true // lag 0 until the search finds the real one
-	e.provisional = true
+	// The playback position lines the reference up with the mic to within
+	// the device's latency, which AEC3's own delay estimator handles. Our
+	// envelope search isn't applied: the earpiece's echo is weak next to
+	// the user's voice and it latched onto wrong lags (1.9 s, 3 s) in a real
+	// call, while the fixed alignment cancelled the echo.
+	e.hasLag = true
+	e.fixedLag = true
 	return &bbUpEcho{echo: e}
 }
 
 func (u *bbUpEcho) close() { u.echo.close() }
 
-func (u *bbUpEcho) lagMs() int { return u.echo.lagMs() }
+// lagMs is the lag the envelope search finds (for the log; not applied).
+func (u *bbUpEcho) lagMs() int { return u.echo.foundMs() }
 
 // report: mic frames that carried a playback position since the last call,
 // and the lag search's last correlation.
@@ -74,6 +82,7 @@ func (u *bbUpEcho) toPhone(pcm []float32) {
 func (u *bbUpEcho) resync() {
 	u.mu.Lock()
 	u.hasPos = false
+	u.resynced = true
 	u.mu.Unlock()
 }
 
@@ -84,11 +93,18 @@ func (u *bbUpEcho) mic(pcm []float32, played uint16) {
 	u.mu.Lock()
 	var p int64
 	if !u.hasPos {
-		// The first frame (of a connection): line the phone's position up
-		// with the newest audio sent. Whatever is still in flight to the
-		// phone or in its buffer makes the echo come later than that, a
-		// positive lag the search finds.
-		p = u.histEnd
+		// The first frame. At the start of a call the phone's position and
+		// the audio sent count from the same point (the phone's playback
+		// buffer and the gateway's history both begin with the call), so
+		// the position is the index itself. After a reconnection
+		// (resync) audio sent meanwhile was lost: line the position up with
+		// the newest audio sent instead; what is still in flight then makes
+		// the echo come a little later, which AEC3 copes with.
+		if u.resynced {
+			p = u.histEnd
+		} else {
+			p = int64(played)
+		}
 		u.hasPos = true
 		u.pos = p - int64(len(pcm))
 	} else {

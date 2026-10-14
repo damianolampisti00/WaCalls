@@ -60,9 +60,10 @@ type bbEcho struct {
 	hasLag bool
 	cand   int64   // a new lag seen once, confirmed by the next estimate
 	corr   float64 // the best correlation of the last estimate (for the log)
-	// provisional: the lag is a starting guess (bbupecho.go), so the first
-	// clear estimate replaces it at once instead of needing a confirmation.
-	provisional bool
+	// fixedLag: the streams are already aligned (bbupecho.go) and the lag
+	// stays as set; the search still runs, for the log (found, corr).
+	fixedLag bool
+	found    int64
 
 	lead int64 // samples the reference is fed ahead of the estimated echo
 	// aligned: reference and capture arrive in lockstep (bbupecho.go), so
@@ -84,6 +85,17 @@ func (e *bbEcho) lagMs() int {
 		return -1
 	}
 	return int(e.lag * 1000 / bbEchoRate)
+}
+
+// foundMs is the lag the search last found with a clear peak (fixedLag
+// mode, where it isn't applied), -1 if none.
+func (e *bbEcho) foundMs() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.corr < bbEchoMinCorr {
+		return -1
+	}
+	return int(e.found * 1000 / bbEchoRate)
 }
 
 // lastCorr is the best envelope correlation of the last lag search: how
@@ -235,10 +247,14 @@ func (e *bbEcho) estimate() {
 	if best < bbEchoMinCorr {
 		return
 	}
+	if e.fixedLag {
+		e.found = bestLag * bbEchoBlock
+		return
+	}
 	lag := bestLag * bbEchoBlock
 	switch {
-	case !e.hasLag || e.provisional:
-		e.lag, e.hasLag, e.provisional = lag, true, false
+	case !e.hasLag:
+		e.lag, e.hasLag = lag, true
 	case lag == e.lag:
 		e.cand = 0
 	case lag == e.cand:

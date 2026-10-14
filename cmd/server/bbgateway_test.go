@@ -164,3 +164,45 @@ func TestBBAGCUplinkAimsAtCallLevel(t *testing.T) {
 		t.Fatalf("uplink gain %.2f, want the +12 dB cap", a.gain)
 	}
 }
+
+// The pacer: audio arriving in bursts goes out one 20 ms frame per tick,
+// a stall longer than the buffer becomes silence, and the backlog of a long
+// stall is cut back to the target instead of delaying everything after it.
+func TestBBUpPacer(t *testing.T) {
+	p := &bbUpPacer{stop: make(chan struct{})} // driven by hand, no ticker
+	frame := func(v float32) []float32 {
+		f := make([]float32, bbUpFrame)
+		for i := range f {
+			f[i] = v
+		}
+		return f
+	}
+	// Not enough buffered yet: silence.
+	p.push(frame(1))
+	if out := p.next(); out[0] != 0 {
+		t.Fatal("audio before the buffer was full")
+	}
+	for i := 0; i < 4; i++ {
+		p.push(frame(1))
+	}
+	if out := p.next(); out[0] != 1 {
+		t.Fatal("no audio with the buffer full")
+	}
+	// Drain it: then silence and a rebuffer.
+	for i := 0; i < 4; i++ {
+		p.next()
+	}
+	if out := p.next(); out[0] != 0 || p.rebuffers != 1 {
+		t.Fatalf("dry buffer: sample %v, rebuffers %d", out[0], p.rebuffers)
+	}
+	// A 1 s burst after a stall: cut back to the target.
+	for i := 0; i < 50; i++ {
+		p.push(frame(2))
+	}
+	if len(p.buf) > bbUpMax {
+		t.Fatalf("%d samples buffered after a burst, max %d", len(p.buf), bbUpMax)
+	}
+	if p.dropped == 0 {
+		t.Fatal("nothing dropped after a 1 s burst")
+	}
+}
