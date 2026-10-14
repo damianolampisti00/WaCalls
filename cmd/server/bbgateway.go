@@ -647,9 +647,10 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 				up, toPeer, micGain = i, o, gn
 			}
 		}
-		upLag := -1
+		upLag, upFrames, upCorr := -1, 0, 0.0
 		if g.upEcho != nil {
 			upLag = g.upEcho.lagMs()
+			upFrames, upCorr = g.upEcho.report()
 		}
 		echoLag := -1
 		if g.echo != nil {
@@ -657,7 +658,7 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 		}
 		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(raw),
 			"mic_after_aec_dbfs", int(up), "to_peer_dbfs", int(toPeer), "mic_agc_db", int(micGain),
-			"phone_echo_lag_ms", upLag,
+			"phone_echo_lag_ms", upLag, "phone_echo_corr", math.Round(upCorr*100)/100, "pos_frames", upFrames,
 			"echo_lag_ms", echoLag)
 	}
 }

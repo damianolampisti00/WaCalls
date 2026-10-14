@@ -57,7 +57,8 @@ type bbEcho struct {
 
 	lag    int64 // capture index c holds the echo of reference index c-lag
 	hasLag bool
-	cand   int64 // a new lag seen once, confirmed by the next estimate
+	cand   int64   // a new lag seen once, confirmed by the next estimate
+	corr   float64 // the best correlation of the last estimate (for the log)
 
 	lead int64 // samples the reference is fed ahead of the estimated echo
 	// aligned: reference and capture arrive in lockstep (bbupecho.go), so
@@ -79,6 +80,14 @@ func (e *bbEcho) lagMs() int {
 		return -1
 	}
 	return int(e.lag * 1000 / bbEchoRate)
+}
+
+// lastCorr is the best envelope correlation of the last lag search: how
+// clearly the echo shows (below bbEchoMinCorr the lag isn't trusted).
+func (e *bbEcho) lastCorr() float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.corr
 }
 
 func (e *bbEcho) close() {
@@ -213,6 +222,7 @@ func (e *bbEcho) estimate() {
 			best, bestLag = c, lag
 		}
 	}
+	e.corr = best
 	if best < bbEchoMinCorr {
 		return
 	}

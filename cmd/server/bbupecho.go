@@ -27,6 +27,7 @@ type bbUpEcho struct {
 	hasPos bool
 	pos    int64  // playback position at the previous mic frame, in hist's index
 	pos16  uint16 // as the phone reported it
+	frames int    // mic frames with a position since the last report
 }
 
 const (
@@ -45,6 +46,15 @@ func newBBUpEcho() *bbUpEcho {
 func (u *bbUpEcho) close() { u.echo.close() }
 
 func (u *bbUpEcho) lagMs() int { return u.echo.lagMs() }
+
+// report: mic frames that carried a playback position since the last call,
+// and the lag search's last correlation.
+func (u *bbUpEcho) report() (frames int, corr float64) {
+	u.mu.Lock()
+	frames, u.frames = u.frames, 0
+	u.mu.Unlock()
+	return frames, u.echo.lastCorr()
+}
 
 // toPhone records the audio sent to the phone, as sent.
 func (u *bbUpEcho) toPhone(pcm []float32) {
@@ -96,6 +106,7 @@ func (u *bbUpEcho) mic(pcm []float32, played uint16) {
 		}
 	}
 	u.pos, u.pos16 = p, played
+	u.frames++
 	u.mu.Unlock()
 
 	u.echo.sent(ref)
