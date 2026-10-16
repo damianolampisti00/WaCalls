@@ -189,7 +189,32 @@ func (s *Session) handleEvent(rawEvt any) {
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
 		}
+	// Not acted on, logged: they tell whether the peer's devices got an offer.
+	case *events.CallPreAccept:
+		s.log.Info("call preaccept", "call_id", evt.CallID, "from", evt.From.String())
+	case *events.CallRelayLatency:
+		s.log.Info("call relaylatency", "call_id", evt.CallID, "from", evt.From.String())
+	case *events.CallOfferNotice:
+		s.log.Info("call offer notice", "call_id", evt.CallID, "from", evt.From.String(), "media", evt.Media)
+	case *events.UnknownCallEvent:
+		if evt.Node != nil {
+			s.log.Info("unknown call event", "children", callChildTags(evt.Node))
+		}
+	case *events.Receipt:
+		if s.reg.count() > 0 {
+			s.log.Info("receipt during a call", "type", string(evt.Type), "from", evt.Sender.String(), "ids", evt.MessageIDs)
+		}
 	}
+}
+
+func callChildTags(n *waBinary.Node) []string {
+	var tags []string
+	if kids, ok := n.Content.([]waBinary.Node); ok {
+		for _, k := range kids {
+			tags = append(tags, k.Tag)
+		}
+	}
+	return tags
 }
 
 func (s *Session) connect(ctx context.Context) error {

@@ -206,7 +206,8 @@ func (m *CallManager) HandleCallAck(ctx context.Context, node *waBinary.Node) {
 		return
 	}
 	parsed := signaling.ParseRelayFromAck(node)
-	m.log.Info("offer ack received", "relays", len(parsed.Relays), "participants", len(parsed.ParticipantJids))
+	m.log.Info("offer ack received", "relays", len(parsed.Relays), "participants", len(parsed.ParticipantJids),
+		"participant_jids", parsed.ParticipantJids, "children", childTagSummary(node))
 	if len(parsed.Relays) == 0 {
 		return
 	}

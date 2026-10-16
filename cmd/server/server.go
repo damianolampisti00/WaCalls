@@ -41,7 +41,9 @@ func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, log 
 		return nil, err
 	}
 
-	waLogger := waLog.Noop
+	// whatsmeow's warnings always: a retry receipt or an undelivered call
+	// offer only shows up there.
+	waLogger := waLog.Stdout("WA", "WARN", true)
 	if log.Enabled(ctx, slog.LevelDebug) {
 		waLogger = waLog.Stdout("WA", "INFO", true)
 	}

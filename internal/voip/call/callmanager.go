@@ -114,6 +114,9 @@ func (m *CallManager) StartCall(ctx context.Context, callID string, peerJid type
 	if err != nil {
 		return err
 	}
+	devices, privacy := offerSummary(offer)
+	m.log.Info("call offer built", "call_id", callID, "stanza_id", wanode.AttrString(offer.Attrs, "id"),
+		"devices", devices, "privacy_token", privacy)
 	ackNode, err := m.sock.Query(ctx, offer)
 	if err != nil {
 		return err

@@ -74,6 +74,24 @@ func childTagSummary(n *waBinary.Node) string {
 	return strings.Join(parts, " ")
 }
 
+// offerSummary: the devices an offer goes to and whether it carries the
+// peer's privacy token (never the token or the keys themselves).
+func offerSummary(offer waBinary.Node) (devices []string, privacy bool) {
+	for _, inner := range wanode.NodeChildren(&offer) {
+		for _, c := range wanode.NodeChildren(&inner) {
+			switch c.Tag {
+			case "privacy":
+				privacy = true
+			case "destination":
+				for _, to := range wanode.NodeChildren(&c) {
+					devices = append(devices, wanode.AttrString(to.Attrs, "jid"))
+				}
+			}
+		}
+	}
+	return devices, privacy
+}
+
 func relayEndpointCount(rd *core.RelayData) int {
 	if rd == nil {
 		return 0
