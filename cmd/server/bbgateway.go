@@ -729,10 +729,10 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 		if g.upPacer != nil {
 			pacerRebuf, pacerDropMs, pacerBufMs = g.upPacer.report()
 		}
-		upLag, upFrames, upCorr := -1, 0, 0.0
+		upLag, upFrames, upCorr, upSup := -1, 0, 0.0, 0
 		if g.upEcho != nil {
 			upLag = g.upEcho.lagMs()
-			upFrames, upCorr = g.upEcho.report()
+			upFrames, upCorr, upSup = g.upEcho.report()
 		}
 		echoLag := -1
 		if g.echo != nil {
@@ -741,6 +741,7 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 		g.log.Info("call levels", "peer_dbfs", int(in), "to_phone_dbfs", int(out), "agc_db", int(gain), "phone_mic_dbfs", int(raw),
 			"mic_after_aec_dbfs", int(up), "to_peer_dbfs", int(toPeer), "mic_agc_db", int(micGain),
 			"phone_echo_lag_ms", upLag, "phone_echo_corr", math.Round(upCorr*100)/100, "pos_frames", upFrames,
+			"echo_sup_pct", upSup,
 			"mic_late", g.upLate, "mic_max_gap_ms", g.upMaxGap.Milliseconds(), "phone_send_max_gap_ms", g.upMaxSendGap, "silent_frames", g.upKeepalive,
 			"pacer_rebuf", pacerRebuf, "pacer_dropped_ms", pacerDropMs, "pacer_buffered_ms", pacerBufMs,
 			"echo_lag_ms", echoLag)

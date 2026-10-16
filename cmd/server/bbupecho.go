@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"math"
+	"sync"
+)
 
 // The phone's own echo: the peer's voice coming out of the BlackBerry's
 // earpiece or loudspeaker and back into its microphone. The phone has no
@@ -30,9 +33,23 @@ type bbUpEcho struct {
 	frames int    // mic frames with a position since the last report
 
 	resynced bool // the phone reconnected during the call
+
+	// Residual echo suppressor, after AEC3 (see suppress).
+	refLevel  float64 // what the phone played lately (RMS, decaying peak)
+	supGain   float64 // gain applied to the mic now
+	supFrames int     // mic frames attenuated since the last report
 }
 
 const (
+	// Residual echo suppression: a mic frame more than 14 dB below what the
+	// phone was playing is taken for echo and turned down 14 dB. Measured
+	// 2026-10-16 (phone at the ear): the peer's voice played at -19 dBFS
+	// came back at -42 dBFS, the user's own voice is -20..-24 dBFS.
+	bbSupRatio = 0.2  // mic RMS / played RMS below this: echo
+	bbSupGain  = 0.2  // -14 dB on echo
+	bbSupFloor = 0.003 // played below ~-50 dBFS: nothing to suppress
+	bbSupDecay = 0.85  // per mic frame (20 ms): the played level's tail
+
 	bbUpHistKeep = 4 * bbEchoRate
 	bbUpEchoLead = 320 // 20 ms: the reference may lead the echo a little, never trail it
 )
@@ -48,7 +65,7 @@ func newBBUpEcho() *bbUpEcho {
 	// call, while the fixed alignment cancelled the echo.
 	e.hasLag = true
 	e.fixedLag = true
-	return &bbUpEcho{echo: e}
+	return &bbUpEcho{echo: e, supGain: 1}
 }
 
 func (u *bbUpEcho) close() { u.echo.close() }
@@ -57,12 +74,54 @@ func (u *bbUpEcho) close() { u.echo.close() }
 func (u *bbUpEcho) lagMs() int { return u.echo.foundMs() }
 
 // report: mic frames that carried a playback position since the last call,
-// and the lag search's last correlation.
-func (u *bbUpEcho) report() (frames int, corr float64) {
+// the lag search's last correlation and the share of frames the suppressor
+// turned down (percent).
+func (u *bbUpEcho) report() (frames int, corr float64, supPct int) {
 	u.mu.Lock()
 	frames, u.frames = u.frames, 0
+	if frames > 0 {
+		supPct = u.supFrames * 100 / frames
+	}
+	u.supFrames = 0
 	u.mu.Unlock()
-	return frames, u.echo.lastCorr()
+	return frames, u.echo.lastCorr(), supPct
+}
+
+func rmsOf(pcm []float32) float64 {
+	if len(pcm) == 0 {
+		return 0
+	}
+	var s float64
+	for _, v := range pcm {
+		s += float64(v) * float64(v)
+	}
+	return math.Sqrt(s / float64(len(pcm)))
+}
+
+// suppress turns the mic down where AEC3 left echo: the peer's voice
+// playing and the mic well below it. AEC3 needs seconds of the peer talking
+// before it cancels anything (2026-10-16: nothing removed in the first 10 s
+// of a call), and the mic AGC after it lifted that echo by +12 dB back to the
+// peer. Down in ~3 frames, back up at once (ramped over the frame) when the
+// user talks. Called with u.mu held.
+func (u *bbUpEcho) suppress(pcm []float32, playedRMS float64) {
+	u.refLevel = math.Max(playedRMS, u.refLevel*bbSupDecay)
+	target := 1.0
+	if u.refLevel > bbSupFloor && rmsOf(pcm) < u.refLevel*bbSupRatio {
+		target = bbSupGain
+		u.supFrames++
+	}
+	from := u.supGain
+	to := target
+	if to < from {
+		to = math.Max(target, from*0.5)
+	}
+	n := len(pcm)
+	for i := range pcm {
+		g := from + (to-from)*float64(i+1)/float64(n)
+		pcm[i] = float32(float64(pcm[i]) * g)
+	}
+	u.supGain = to
 }
 
 // toPhone records the audio sent to the phone, as sent.
@@ -128,4 +187,8 @@ func (u *bbUpEcho) mic(pcm []float32, played uint16) {
 
 	u.echo.sent(ref)
 	u.echo.process(pcm)
+
+	u.mu.Lock()
+	u.suppress(pcm, rmsOf(ref))
+	u.mu.Unlock()
 }

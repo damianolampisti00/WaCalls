@@ -142,3 +142,42 @@ func upEchoERLE(seed int64, seconds, devLat int, gain float64, fromSec int) (flo
 	}
 	return 10 * math.Log10(echoIn/(echoOut+1e-12)), u.lagMs()
 }
+
+func tone(n int, amp float64) []float32 {
+	pcm := make([]float32, n)
+	for i := range pcm {
+		pcm[i] = float32(amp * math.Sin(float64(i)*2*math.Pi*440/bbEchoRate))
+	}
+	return pcm
+}
+
+// The residual echo suppressor with the levels of a real call (2026-10-16):
+// the peer's voice played at about -19 dBFS, its echo in the mic at -42 dBFS,
+// the user's own voice -20..-24 dBFS.
+func TestBBUpEchoSuppressor(t *testing.T) {
+	u := &bbUpEcho{supGain: 1}
+	played := rmsOf(tone(320, 0.16)) // ~ -19 dBFS RMS
+
+	// echo only: down to bbSupGain within a few frames
+	for i := 0; i < 5; i++ {
+		u.suppress(tone(320, 0.011), played) // ~ -42 dBFS RMS
+	}
+	if math.Abs(u.supGain-bbSupGain) > 1e-9 {
+		t.Fatalf("echo: gain %.3f, want %.3f", u.supGain, bbSupGain)
+	}
+
+	// the user talks over the peer: full level at once
+	u.suppress(tone(320, 0.1), played) // ~ -23 dBFS RMS
+	if u.supGain != 1 {
+		t.Fatalf("double talk: gain %.3f, want 1", u.supGain)
+	}
+
+	// nothing played: the user's quiet voice untouched
+	u2 := &bbUpEcho{supGain: 1}
+	for i := 0; i < 5; i++ {
+		u2.suppress(tone(320, 0.02), 0)
+	}
+	if u2.supGain != 1 || u2.supFrames != 0 {
+		t.Fatalf("no playback: gain %.3f, %d frames suppressed", u2.supGain, u2.supFrames)
+	}
+}
