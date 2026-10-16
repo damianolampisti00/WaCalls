@@ -249,7 +249,11 @@ turns the broker's call events into a simple protocol for the phone:
   - the phone's own earpiece/speaker in its mic (`bbupecho.go`): with flag
     `0x01` the phone puts its playback position (downlink samples played,
     mod 65536) in bytes 2-3 of each mic frame, so the reference is exactly
-    what it played, pauses and jitter-buffer refills included;
+    what it played, pauses and jitter-buffer refills included. AEC3 needs
+    a few seconds before it cancels anything, so a residual echo suppressor
+    follows: a mic frame more than 14 dB below what the phone was playing
+    is taken for echo and turned down 14 dB (the user's own voice is close
+    to the playback level and passes);
   - the user's voice coming back from a hands-free peer (`bbecho.go`), the
     round trip found by an envelope search;
 - boost-only AGCs (`bbagc.go`) on the peer's voice and, after the echo
@@ -258,7 +262,7 @@ turns the broker's call events into a simple protocol for the phone:
   bursts after stalls of up to a second; a 100 ms buffer feeds the call one
   20 ms frame per tick, silence while it refills, and cuts a backlog over
   300 ms back, so the peer hears neither jumps nor crackles;
-- `call levels` in the log every 10 s (levels, echo canceller, mic timing).
+- `call levels` in the log every 10 s (levels, echo canceller and suppressor, mic timing).
 
 Two fixes outside the gateway: a session whose first connect fails at boot
 (network not up yet) is retried with a backoff, since whatsmeow only
