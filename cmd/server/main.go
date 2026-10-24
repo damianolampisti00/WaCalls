@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -61,6 +62,7 @@ func main() {
 			log.Error("Berry Bridge gateway needs -bb-token-file with a token of 16+ characters", "err", err)
 			os.Exit(1)
 		}
+		bbDumpFlag = filepath.Join(filepath.Dir(*bbTokenFile), "echo_dump_next")
 		gw := newBBGateway(srv.sessions, srv.broker, string(token), *bbSession, log)
 		bbSrv = &http.Server{Addr: *bbAddr, Handler: gw.routes()}
 		go func() {

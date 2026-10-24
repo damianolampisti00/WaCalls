@@ -38,6 +38,8 @@ type bbUpEcho struct {
 	refLevel  float64 // what the phone played lately (RMS, decaying peak)
 	supGain   float64 // gain applied to the mic now
 	supFrames int     // mic frames attenuated since the last report
+
+	dump *bbDump // a recording of this call (bbdump.go), usually nil
 }
 
 const (
@@ -65,10 +67,16 @@ func newBBUpEcho() *bbUpEcho {
 	// call, while the fixed alignment cancelled the echo.
 	e.hasLag = true
 	e.fixedLag = true
-	return &bbUpEcho{echo: e, supGain: 1}
+	return &bbUpEcho{echo: e, supGain: 1, dump: newBBDumpIfFlagged()}
 }
 
-func (u *bbUpEcho) close() { u.echo.close() }
+func (u *bbUpEcho) close() {
+	u.echo.close()
+	u.mu.Lock()
+	u.dump.close()
+	u.dump = nil
+	u.mu.Unlock()
+}
 
 // lagMs is the lag the envelope search finds (for the log; not applied).
 func (u *bbUpEcho) lagMs() int { return u.echo.foundMs() }
@@ -183,6 +191,10 @@ func (u *bbUpEcho) mic(pcm []float32, played uint16) {
 	}
 	u.pos, u.pos16 = p, played
 	u.frames++
+	if u.dump != nil {
+		bbDumpWrite(u.dump.mic, pcm)
+		bbDumpWrite(u.dump.ref, ref)
+	}
 	u.mu.Unlock()
 
 	u.echo.sent(ref)
@@ -190,5 +202,8 @@ func (u *bbUpEcho) mic(pcm []float32, played uint16) {
 
 	u.mu.Lock()
 	u.suppress(pcm, rmsOf(ref))
+	if u.dump != nil {
+		bbDumpWrite(u.dump.out, pcm)
+	}
 	u.mu.Unlock()
 }
