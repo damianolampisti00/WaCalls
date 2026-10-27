@@ -169,7 +169,7 @@ func TestBBAGCUplinkAimsAtCallLevel(t *testing.T) {
 // a stall longer than the buffer becomes silence, and the backlog of a long
 // stall is cut back to the target instead of delaying everything after it.
 func TestBBUpPacer(t *testing.T) {
-	p := &bbUpPacer{stop: make(chan struct{})} // driven by hand, no ticker
+	p := &bbUpPacer{stop: make(chan struct{}), target: bbUpMinTarget} // driven by hand, no ticker
 	frame := func(v float32) []float32 {
 		f := make([]float32, bbUpFrame)
 		for i := range f {
@@ -199,8 +199,8 @@ func TestBBUpPacer(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		p.push(frame(2))
 	}
-	if len(p.buf) > bbUpMax {
-		t.Fatalf("%d samples buffered after a burst, max %d", len(p.buf), bbUpMax)
+	if max := p.target + bbUpOverflow; len(p.buf) > max {
+		t.Fatalf("%d samples buffered after a burst, max %d", len(p.buf), max)
 	}
 	if p.dropped == 0 {
 		t.Fatal("nothing dropped after a 1 s burst")

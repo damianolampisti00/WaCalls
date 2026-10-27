@@ -725,9 +725,9 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 			}
 		}
 		defer func() { g.upLate, g.upMaxGap, g.upKeepalive, g.upMaxSendGap = 0, 0, 0, 0 }()
-		pacerRebuf, pacerDropMs, pacerBufMs := 0, 0, 0
+		pacerRebuf, pacerDropMs, pacerBufMs, pacerTargetMs := 0, 0, 0, 0
 		if g.upPacer != nil {
-			pacerRebuf, pacerDropMs, pacerBufMs = g.upPacer.report()
+			pacerRebuf, pacerDropMs, pacerBufMs, pacerTargetMs = g.upPacer.report()
 		}
 		upLag, upFrames, upCorr, upSup := -1, 0, 0.0, 0
 		if g.upEcho != nil {
@@ -744,6 +744,6 @@ func (g *bbGateway) levelAndReport(pcm []float32) {
 			"echo_sup_pct", upSup,
 			"mic_late", g.upLate, "mic_max_gap_ms", g.upMaxGap.Milliseconds(), "phone_send_max_gap_ms", g.upMaxSendGap, "silent_frames", g.upKeepalive,
 			"pacer_rebuf", pacerRebuf, "pacer_dropped_ms", pacerDropMs, "pacer_buffered_ms", pacerBufMs,
-			"echo_lag_ms", echoLag)
+			"pacer_target_ms", pacerTargetMs, "echo_lag_ms", echoLag)
 	}
 }
