@@ -171,6 +171,9 @@ func (s *Session) handleEvent(rawEvt any) {
 		s.setAuth(AuthSnapshot{State: "open", Paired: true})
 	case *events.LoggedOut:
 		s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
+	case *events.ClientOutdated:
+		s.setAuth(AuthSnapshot{State: "outdated", Paired: true})
+		go s.mgr.onClientOutdated()
 	case *events.CallOffer:
 		s.onIncomingOffer(ctx, evt)
 	case *events.CallAccept:

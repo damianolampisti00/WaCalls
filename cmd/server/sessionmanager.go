@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -26,6 +27,8 @@ type SessionManager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	order    []string
+
+	outdatedLoop atomic.Bool // onClientOutdated is running
 }
 
 func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int) *SessionManager {

@@ -42,6 +42,7 @@ func main() {
 	}
 	defer srv.sessions.disconnectAll()
 
+	refreshWAVersion(ctx, log)
 	if err := srv.sessions.Restore(ctx); err != nil {
 		log.Error("session restore failed", "err", err)
 		os.Exit(1)
