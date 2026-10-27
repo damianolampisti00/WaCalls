@@ -13,7 +13,7 @@ import (
 // room response, plus the user talking now and then. Each mic frame reports
 // the playback position. The echo must be cut by at least 10 dB.
 func TestBBUpEchoCancels(t *testing.T) {
-	erle, lag := upEchoERLE(2, 40, 960, 1, 25) // handset: 60 ms, a weak echo
+	erle, lag := upEchoERLE(2, 40, 960, 1, 25, false) // handset: 60 ms, a weak echo
 	t.Logf("lag %d ms, echo reduced by %.1f dB", lag, erle)
 	if erle < 10 {
 		t.Fatalf("echo reduced by only %.1f dB", erle)
@@ -23,7 +23,20 @@ func TestBBUpEchoCancels(t *testing.T) {
 // A short call on the loudspeaker: the echo as loud as the playback, 300 ms
 // later; it must be cut from the first seconds on.
 func TestBBUpEchoShortLoudCall(t *testing.T) {
-	erle, lag := upEchoERLE(3, 20, 4800, 3, 8)
+	erle, lag := upEchoERLE(3, 20, 4800, 3, 8, false)
+	t.Logf("lag %d ms, echo reduced by %.1f dB", lag, erle)
+	if erle < 10 {
+		t.Fatalf("echo reduced by only %.1f dB", erle)
+	}
+}
+
+// The frames as the phone sends them: in bursts (its network pump), each
+// with the position of its own capture (counted in samples since 2.0.0.76;
+// before, the position was read when a frame was SENT, in whole 21 ms device
+// blocks, 0..60 ms late, and AEC3 cancelled nothing). The echo must be cut
+// by at least 10 dB.
+func TestBBUpEchoBurstyFrames(t *testing.T) {
+	erle, lag := upEchoERLE(4, 40, 960, 1, 25, true)
 	t.Logf("lag %d ms, echo reduced by %.1f dB", lag, erle)
 	if erle < 10 {
 		t.Fatalf("echo reduced by only %.1f dB", erle)
@@ -32,8 +45,9 @@ func TestBBUpEchoShortLoudCall(t *testing.T) {
 
 // upEchoERLE simulates seconds of call (devLat samples from playback to the
 // mic, the room response scaled by gain) and returns the echo reduction
-// measured from fromSec on, and the lag found.
-func upEchoERLE(seed int64, seconds, devLat int, gain float64, fromSec int) (float64, int) {
+// measured from fromSec on, and the lag found. bursty: the frames come in
+// bursts, as from the real phone (see TestBBUpEchoBurstyFrames).
+func upEchoERLE(seed int64, seconds, devLat int, gain float64, fromSec int, bursty bool) (float64, int) {
 	u := newBBUpEcho()
 	defer u.close()
 	rng := rand.New(rand.NewSource(seed))
@@ -93,6 +107,27 @@ func upEchoERLE(seed int64, seconds, devLat int, gain float64, fromSec int) (flo
 
 	next := 0
 	var echoIn, echoOut float64
+	type micFrame struct {
+		pcm, in  []float32
+		echoOnly []bool
+		measure  bool
+		stamp    int64
+	}
+	var pending []micFrame
+	release := func() {
+		for _, f := range pending {
+			u.mic(f.pcm, uint16(f.stamp))
+			if f.measure {
+				for i := range f.pcm {
+					if f.echoOnly[i] {
+						echoIn += float64(f.in[i]) * float64(f.in[i])
+						echoOut += float64(f.pcm[i]) * float64(f.pcm[i])
+					}
+				}
+			}
+		}
+		pending = pending[:0]
+	}
 	for clock := 0; clock+frame <= total; clock += frame {
 		// Packets that have arrived by now; the gateway records them as sent.
 		for next < len(arrivals) && arrivals[next].at <= clock {
@@ -130,14 +165,9 @@ func upEchoERLE(seed int64, seconds, devLat int, gain float64, fromSec int) (flo
 			echoOnly[i] = near[c] == 0 && echo != 0
 		}
 		in := append([]float32(nil), mic...)
-		u.mic(mic, uint16(taken))
-		if clock > fromSec*bbEchoRate {
-			for i := range mic {
-				if echoOnly[i] {
-					echoIn += float64(in[i]) * float64(in[i])
-					echoOut += float64(mic[i]) * float64(mic[i])
-				}
-			}
+		pending = append(pending, micFrame{mic, in, echoOnly, clock > fromSec*bbEchoRate, taken})
+		if !bursty || len(pending) >= 3 || rng.Float64() < 0.35 {
+			release()
 		}
 	}
 	return 10 * math.Log10(echoIn/(echoOut+1e-12)), u.lagMs()

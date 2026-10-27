@@ -34,6 +34,12 @@ type bbUpEcho struct {
 
 	resynced bool // the phone reconnected during the call
 
+	// The reported positions, smoothed (see smoothPos).
+	micIdx int64 // mic samples so far
+	hasOff bool
+	off    int64 // position - micIdx in use
+	spos   int64 // smoothed position at the previous frame
+
 	// Residual echo suppressor, after AEC3 (see suppress).
 	refLevel  float64 // what the phone played lately (RMS, decaying peak)
 	supGain   float64 // gain applied to the mic now
@@ -47,13 +53,23 @@ const (
 	// phone was playing is taken for echo and turned down 14 dB. Measured
 	// 2026-10-16 (phone at the ear): the peer's voice played at -19 dBFS
 	// came back at -42 dBFS, the user's own voice is -20..-24 dBFS.
-	bbSupRatio = 0.2  // mic RMS / played RMS below this: echo
-	bbSupGain  = 0.2  // -14 dB on echo
+	bbSupRatio = 0.2   // mic RMS / played RMS below this: echo
+	bbSupGain  = 0.2   // -14 dB on echo
 	bbSupFloor = 0.003 // played below ~-50 dBFS: nothing to suppress
 	bbSupDecay = 0.85  // per mic frame (20 ms): the played level's tail
 
 	bbUpHistKeep = 4 * bbEchoRate
 	bbUpEchoLead = 320 // 20 ms: the reference may lead the echo a little, never trail it
+
+	// The phone's position moves against its mic only when its playback
+	// stalls (silence until the jitter buffer refills, about once a second)
+	// or skips a block; in between the two run in lockstep. A reference that
+	// shifts by even a fraction of a millisecond now and then keeps AEC3 from
+	// converging (2026-10-26: phones up to 2.0.0.75 stamped the frames 0..60
+	// ms late, and the echo was not cancelled at all; since 2.0.0.76 the
+	// position is counted in samples, not timed). The offset only follows a
+	// change larger than this, and then at once.
+	bbUpOffTol = 32 // samples: 2 ms
 )
 
 func newBBUpEcho() *bbUpEcho {
@@ -150,7 +166,18 @@ func (u *bbUpEcho) resync() {
 	u.mu.Lock()
 	u.hasPos = false
 	u.resynced = true
+	u.hasOff = false
 	u.mu.Unlock()
+}
+
+// smoothPos turns the position the phone reported at the end of a mic frame
+// of n samples into the smoothed one (see bbUpOffTol). Called with u.mu held.
+func (u *bbUpEcho) smoothPos(p int64, n int) int64 {
+	u.micIdx += int64(n)
+	if o := p - u.micIdx; !u.hasOff || o < u.off-bbUpOffTol || o > u.off+bbUpOffTol {
+		u.off, u.hasOff = o, true
+	}
+	return u.micIdx + u.off
 }
 
 // mic cancels the phone's echo in a mic frame, in place. played is the
@@ -174,14 +201,25 @@ func (u *bbUpEcho) mic(pcm []float32, played uint16) {
 		}
 		u.hasPos = true
 		u.pos = p - int64(len(pcm))
+		u.hasOff = false
+		u.spos = p - int64(len(pcm))
 	} else {
-		p = u.pos + int64(uint16(played-u.pos16))
+		// Signed: a position taken at capture time may come a hair below
+		// the previous one (thread scheduling); unsigned that was a jump
+		// of four seconds ahead.
+		p = u.pos + int64(int16(played-u.pos16))
 	}
+	sp := u.smoothPos(p, len(pcm))
 	// What was played since the previous frame; when the phone played less
-	// than a frame's worth (its buffer ran dry) the rest was silence.
-	from, n := u.pos, p-u.pos
+	// than a frame's worth (its buffer ran dry) the rest was silence. The
+	// smoothed position never goes back: a lower estimate means the phone
+	// stalled, so silence until it catches up.
+	from, n := u.spos, sp-u.spos
 	if n > int64(len(pcm)) {
-		from, n = p-int64(len(pcm)), int64(len(pcm))
+		from, n = sp-int64(len(pcm)), int64(len(pcm))
+	}
+	if sp > u.spos {
+		u.spos = sp
 	}
 	histStart := u.histEnd - int64(len(u.hist))
 	for i := int64(0); i < n; i++ {
