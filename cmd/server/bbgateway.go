@@ -20,6 +20,7 @@ package main
 //     {"type":"call.ended","callId":..,"reason":"user_ended|declined|busy|timeout|..."}
 //     {"type":"call.started","callId":..}         (answer to call.start)
 //     {"type":"pong","t":<echoed>}
+//     {"type":"notify","title":..,"body":..,"key":..}  (from POST /notify, see handleNotify)
 //     {"type":"error","for":<request type>,"message":..}
 //   Phone -> server:
 //     {"type":"call.start","phone":"+39..."}
@@ -155,6 +156,7 @@ func (g *bbGateway) authorized(r *http.Request) bool {
 func (g *bbGateway) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ws", g.handleWS)
+	mux.HandleFunc("POST /notify", g.handleNotify)
 	return mux
 }
 
@@ -204,6 +206,31 @@ func (g *bbGateway) handleWS(w http.ResponseWriter, r *http.Request) {
 	g.mu.Unlock()
 	_ = ws.Close(websocket.StatusNormalClosure, "")
 	g.log.Info("phone disconnected")
+}
+
+// handleNotify puts a Hub notification on the phone through the link it
+// already keeps open, so a script on this server (e.g. a Claude Code hook)
+// can reach the phone at no battery cost. Same token as /ws. Body:
+// {"title":..,"body":..,"key":..}; a later notification with the same key
+// replaces the earlier one. 503 when the phone is not connected.
+func (g *bbGateway) handleNotify(w http.ResponseWriter, r *http.Request) {
+	if !g.authorized(r) {
+		time.Sleep(500 * time.Millisecond)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var req struct{ Title, Body, Key string }
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil || req.Title == "" {
+		http.Error(w, "want JSON {title, body, key}", http.StatusBadRequest)
+		return
+	}
+	c := g.current()
+	if c == nil {
+		http.Error(w, "phone not connected", http.StatusServiceUnavailable)
+		return
+	}
+	c.sendJSON(map[string]any{"type": "notify", "title": req.Title, "body": req.Body, "key": req.Key})
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (g *bbGateway) writer(c *bbConn) {

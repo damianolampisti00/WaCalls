@@ -81,6 +81,52 @@ func TestBBGatewayEchoAndPing(t *testing.T) {
 	}
 }
 
+func TestBBGatewayNotify(t *testing.T) {
+	gw := newBBGateway(nil, NewBroker(), testToken, "", slog.Default())
+	srv := httptest.NewServer(gw.routes())
+	defer srv.Close()
+	post := func(auth, body string) int {
+		req, _ := http.NewRequest("POST", srv.URL+"/notify", strings.NewReader(body))
+		req.Header.Set("Authorization", auth)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := post("Bearer wrong-token-0123456789", `{"title":"x"}`); got != http.StatusUnauthorized {
+		t.Fatalf("wrong token: %d, want 401", got)
+	}
+	if got := post("Bearer "+testToken, `{"title":"x"}`); got != http.StatusServiceUnavailable {
+		t.Fatalf("no phone: %d, want 503", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h := http.Header{}
+	h.Set("Authorization", "Bearer "+testToken)
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws", &websocket.DialOptions{HTTPHeader: h})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer ws.CloseNow()
+	if _, _, err := ws.Read(ctx); err != nil { // hello
+		t.Fatal(err)
+	}
+	if got := post("Bearer "+testToken, `{"body":"no title"}`); got != http.StatusBadRequest {
+		t.Fatalf("no title: %d, want 400", got)
+	}
+	if got := post("Bearer "+testToken, `{"title":"Claude","body":"fatto","key":"claude-q10"}`); got != http.StatusNoContent {
+		t.Fatalf("notify: %d, want 204", got)
+	}
+	_, data, err := ws.Read(ctx)
+	if err != nil || !strings.Contains(string(data), `"notify"`) || !strings.Contains(string(data), `"fatto"`) ||
+		!strings.Contains(string(data), `"claude-q10"`) {
+		t.Fatalf("phone got %s %v", data, err)
+	}
+}
+
 func TestBBBridgeFrames(t *testing.T) {
 	gw, ws, ctx := dialGateway(t)
 	br := &bbBridge{g: gw}
