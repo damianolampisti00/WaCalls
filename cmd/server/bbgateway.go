@@ -29,8 +29,12 @@ package main
 //     {"type":"ping","t":<any>}
 //
 //   Binary frames, audio, both directions:
-//     [0] kind: 0x01 PCM, 0x03 Opus  [1] flags (0)  [2:4] reserved
-//     [4:8] sequence number, uint32 LE (per sender, +1 per frame)
+//     [0] kind: 0x01 PCM, 0x03 Opus  [1] flags
+//     [2:4] phone -> server with flag 0x01: downlink samples the phone had
+//           played when the block was captured, uint16 LE mod 65536 (echo
+//           cancellation, onAudio); otherwise 0
+//     [4:8] sequence number, uint32 LE (per sender, +1 per frame; the server
+//           numbers each connection from 1, the phone does not restart it)
 //     [8:12] sender clock in ms, uint32 LE (round-trip measurements)
 //     [12:] 0x01: PCM, signed 16-bit LE, 16 kHz, mono (any length; the
 //           server sends the codec's 60 ms frames, the phone ~20 ms blocks)

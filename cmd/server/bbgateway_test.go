@@ -70,6 +70,9 @@ func TestBBGatewayEchoAndPing(t *testing.T) {
 	}
 	frame := make([]byte, bbHeaderLen+640)
 	frame[0] = bbKindAudio
+	// As CallLink sends it during a call: flag 0x01 with the playback position in [2:4].
+	frame[1] = 0x01
+	binary.LittleEndian.PutUint16(frame[2:], 0xBEEF)
 	binary.LittleEndian.PutUint32(frame[4:], 7)
 	frame[bbHeaderLen] = 0x55
 	if err := ws.Write(ctx, websocket.MessageBinary, frame); err != nil {
@@ -106,6 +109,64 @@ func TestBBBridgeFrames(t *testing.T) {
 		if s := int16(binary.LittleEndian.Uint16(data[bbHeaderLen:])); s < 16000 {
 			t.Fatalf("first sample %d, want >= ~16383", s)
 		}
+	}
+}
+
+// The handshake CallLink (BerryBridge calllink.cpp) runs on every connection:
+// ask for Opus, get "opus" back, then receive 20 ms 0x03 packets; asking for
+// PCM again switches the downlink back to 0x01 frames.
+func TestBBGatewayOpusNegotiation(t *testing.T) {
+	gw, ws, ctx := dialGateway(t)
+	if err := ws.Write(ctx, websocket.MessageText, []byte(`{"type":"audio.codec","codec":"opus"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := ws.Read(ctx)
+	if err != nil || !strings.Contains(string(data), `"audio.codec"`) {
+		t.Fatalf("codec answer: %s %v", data, err)
+	}
+	if !strings.Contains(string(data), `"opus"`) {
+		t.Skipf("gateway built without Opus: %s", data)
+	}
+
+	br := &bbBridge{g: gw}
+	if err := br.WritePCM(make([]float32, 960)); err != nil { // one 60 ms codec frame
+		t.Fatal(err)
+	}
+	dec, err := newBBOpusDecoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.close()
+	for want := uint32(1); want <= 3; want++ { // cut into three 20 ms packets
+		typ, data, err := ws.Read(ctx)
+		if err != nil || typ != websocket.MessageBinary {
+			t.Fatalf("frame: %v %v", typ, err)
+		}
+		if data[0] != bbKindOpus {
+			t.Fatalf("kind %#x, want Opus", data[0])
+		}
+		if seq := binary.LittleEndian.Uint32(data[4:]); seq != want {
+			t.Fatalf("seq %d, want %d", seq, want)
+		}
+		samples, err := dec.decode(data[bbHeaderLen:])
+		if err != nil || len(samples) != bbOpusFrame {
+			t.Fatalf("decode: %d samples, %v; want %d", len(samples), err, bbOpusFrame)
+		}
+	}
+
+	if err := ws.Write(ctx, websocket.MessageText, []byte(`{"type":"audio.codec","codec":"pcm"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err = ws.Read(ctx)
+	if err != nil || !strings.Contains(string(data), `"pcm"`) {
+		t.Fatalf("pcm answer: %s %v", data, err)
+	}
+	if err := br.WritePCM(make([]float32, 960)); err != nil {
+		t.Fatal(err)
+	}
+	typ, data, err := ws.Read(ctx)
+	if err != nil || typ != websocket.MessageBinary || data[0] != bbKindAudio || len(data) != bbHeaderLen+1920 {
+		t.Fatalf("pcm frame: %v kind %#x len %d %v", typ, data[0], len(data), err)
 	}
 }
 
