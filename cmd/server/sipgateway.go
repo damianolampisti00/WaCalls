@@ -557,6 +557,7 @@ func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
 	codec, ok := codecPCMU, false
 	if err == nil {
 		codec, ok = ans.pickCodec(g.cfg.Opus)
+		g.log.Info("phone sdp answer", "call_id", c.waID, "formats", ans.Formats, "rtpmap", ans.RTPMap, "codec", codec.String())
 	}
 	if !ok {
 		g.log.Warn("phone answered without a codec we offered", "err", err)
@@ -689,6 +690,7 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 	codec, ok := codecPCMU, false
 	if err == nil {
 		codec, ok = offer.pickCodec(g.cfg.Opus)
+		g.log.Info("phone sdp offer", "formats", offer.Formats, "rtpmap", offer.RTPMap, "codec", codec.String())
 	}
 	if !ok {
 		_ = p.send(sipResponse(m, 488, "Not Acceptable Here", sipRandom(4)))
