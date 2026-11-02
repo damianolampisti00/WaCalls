@@ -179,30 +179,89 @@ func parseSDP(body []byte) (*sdpAudio, error) {
 	return s, nil
 }
 
-// hasPCMU: payload type 0 is static PCMU even without an rtpmap line.
-func (s *sdpAudio) hasPCMU() bool {
-	for _, pt := range s.Formats {
-		if pt == 0 {
-			return true
-		}
-	}
-	return false
+// sipCodec is the audio of one call: PCMU (G.711 mu-law, 8 kHz) or Opus.
+// The phone's engine names Opus its own way: "126 OPUS/16000" (OPUS-WB),
+// the RTP clock being the sampling rate; RFC 7587's "opus/48000/2" is
+// understood too (clock 48 kHz). Our Opus is 16 kHz mono, 20 ms, 24 kbit/s
+// (bbopus.go): about a quarter of PCMU's bytes, for a weak link.
+type sipCodec struct {
+	PT    int
+	Opus  bool
+	Clock int // RTP timestamp rate
 }
 
-// buildSDP: one audio stream, PCMU, sendrecv. rejectVideo adds a refused
-// video stream (port 0), for an answer to an offer that had one.
-func buildSDP(ip string, port int, sessID int64, rejectVideo bool) []byte {
+var (
+	codecPCMU   = sipCodec{PT: 0, Clock: 8000}
+	codecOpusWB = sipCodec{PT: 126, Opus: true, Clock: 16000}
+)
+
+func (c sipCodec) String() string {
+	if c.Opus {
+		return fmt.Sprintf("opus/%d pt%d", c.Clock, c.PT)
+	}
+	return "pcmu"
+}
+
+// rtpmap is the codec's a=rtpmap value.
+func (c sipCodec) rtpmap() string {
+	if c.Opus {
+		if c.Clock == 48000 {
+			return "opus/48000/2"
+		}
+		return fmt.Sprintf("OPUS/%d", c.Clock)
+	}
+	return "PCMU/8000"
+}
+
+// pickCodec chooses our codec from the other side's formats: Opus at 16 or
+// 48 kHz when allowed and present (in the order they are listed), else PCMU
+// (payload type 0 is static PCMU even without an rtpmap line).
+func (s *sdpAudio) pickCodec(opus bool) (sipCodec, bool) {
+	pcmu := false
+	for _, pt := range s.Formats {
+		if pt == 0 {
+			pcmu = true
+			continue
+		}
+		name, rate, _ := strings.Cut(strings.ToLower(s.RTPMap[pt]), "/")
+		rate, _, _ = strings.Cut(rate, "/")
+		if opus && name == "opus" && (rate == "16000" || rate == "48000") {
+			clock, _ := strconv.Atoi(rate)
+			return sipCodec{PT: pt, Opus: true, Clock: clock}, true
+		}
+	}
+	return codecPCMU, pcmu
+}
+
+// hasPCMU: payload type 0 (static PCMU) is among the formats.
+func (s *sdpAudio) hasPCMU() bool {
+	_, ok := s.pickCodec(false)
+	return ok
+}
+
+// buildSDP: one audio stream with the given codecs (in preference order),
+// 20 ms, sendrecv. rejectVideo adds a refused video stream (port 0), for an
+// answer to an offer that had one.
+func buildSDP(ip string, port int, sessID int64, rejectVideo bool, codecs ...sipCodec) []byte {
+	if len(codecs) == 0 {
+		codecs = []sipCodec{codecPCMU}
+	}
+	pts := make([]string, len(codecs))
+	maps := make([]string, len(codecs))
+	for i, c := range codecs {
+		pts[i] = strconv.Itoa(c.PT)
+		maps[i] = fmt.Sprintf("a=rtpmap:%d %s", c.PT, c.rtpmap())
+	}
 	lines := []string{
 		"v=0",
 		fmt.Sprintf("o=wacalls %d %d IN IP4 %s", sessID, sessID, ip),
 		"s=WaCalls",
 		"c=IN IP4 " + ip,
 		"t=0 0",
-		fmt.Sprintf("m=audio %d RTP/AVP 0", port),
-		"a=rtpmap:0 PCMU/8000",
-		"a=ptime:20",
-		"a=sendrecv",
+		fmt.Sprintf("m=audio %d RTP/AVP %s", port, strings.Join(pts, " ")),
 	}
+	lines = append(lines, maps...)
+	lines = append(lines, "a=ptime:20", "a=sendrecv")
 	if rejectVideo {
 		lines = append(lines, "m=video 0 RTP/AVP 109")
 	}
@@ -212,11 +271,11 @@ func buildSDP(ip string, port int, sessID int64, rejectVideo bool) []byte {
 // ---- RTP session -----------------------------------------------------------
 
 const (
-	rtpFrame = 160 // 20 ms at 8 kHz
+	rtpFrame = 160 // 20 ms at 8 kHz (PCMU); Opus frames are bbOpusFrame at 16 kHz
 	// WhatsApp's audio comes in 60 ms blocks: start (and restart after a
 	// gap) with 80 ms queued, or every block boundary is an underrun.
-	rtpPrebuffer   = 4 * rtpFrame
-	rtpMaxBuffered = 20 * rtpFrame // 400 ms: beyond this the oldest audio goes
+	rtpPrebufferFrames   = 4
+	rtpMaxBufferedFrames = 20 // 400 ms: beyond this the oldest audio goes
 )
 
 // rtpTransport carries RTP datagrams: a UDP socket (udpTransport) or the
@@ -242,8 +301,13 @@ type sipRTP struct {
 	remote atomic.Pointer[net.UDPAddr]
 	ssrc   uint32
 
+	codec sipCodec
+	frame int // samples per 20 ms packet in down: 160 (PCMU, 8 kHz) or 320 (Opus, 16 kHz)
+	enc   *bbOpusEncoder
+	dec   *bbOpusDecoder
+
 	mu      sync.Mutex
-	down    []float32 // 8 kHz audio waiting to be sent
+	down    []float32 // audio waiting to be sent, at the codec's rate
 	started bool
 	ds      downsampler
 	us      upsampler
@@ -267,8 +331,20 @@ func listenRTP(ip string, lo, hi int) (rtpTransport, error) {
 	return nil, fmt.Errorf("rtp: no free port in %d-%d on %s", lo, hi, ip)
 }
 
-func newSIPRTP(conn rtpTransport, remote *net.UDPAddr, onUp func([]float32), log *slog.Logger) *sipRTP {
-	r := &sipRTP{conn: conn, log: log, onUp: onUp, stop: make(chan struct{})}
+func newSIPRTP(conn rtpTransport, remote *net.UDPAddr, codec sipCodec, onUp func([]float32), log *slog.Logger) *sipRTP {
+	r := &sipRTP{conn: conn, log: log, onUp: onUp, stop: make(chan struct{}), codec: codec, frame: rtpFrame}
+	if codec.Opus {
+		var err error
+		if r.enc, err = newBBOpusEncoder(); err == nil {
+			r.dec, err = newBBOpusDecoder()
+		}
+		if err != nil { // no libopus: G.711 would not match the SDP either, so say so
+			log.Error("sip rtp: opus unavailable", "err", err)
+			r.enc.close()
+			r.enc = nil
+		}
+		r.frame = bbOpusFrame
+	}
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	r.ssrc = binary.BigEndian.Uint32(b[:])
@@ -289,8 +365,12 @@ func (r *sipRTP) close() {
 		close(r.stop)
 		_ = r.conn.Close()
 		r.wg.Wait()
-		r.log.Info("sip rtp closed", "sent", r.sent.Load(), "received", r.recv.Load(),
-			"underruns", r.underruns.Load(), "dropped_ms", r.dropped.Load()/8)
+		r.enc.close()
+		if r.dec != nil {
+			r.dec.close()
+		}
+		r.log.Info("sip rtp closed", "codec", r.codec.String(), "sent", r.sent.Load(), "received", r.recv.Load(),
+			"underruns", r.underruns.Load(), "dropped_ms", r.dropped.Load()*20/int64(r.frame))
 	})
 }
 
@@ -298,8 +378,12 @@ func (r *sipRTP) close() {
 func (r *sipRTP) WritePCM(pcm []float32) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.down = append(r.down, r.ds.process(pcm)...)
-	if over := len(r.down) - rtpMaxBuffered; over > 0 {
+	if r.codec.Opus {
+		r.down = append(r.down, pcm...) // already 16 kHz
+	} else {
+		r.down = append(r.down, r.ds.process(pcm)...)
+	}
+	if over := len(r.down) - rtpMaxBufferedFrames*r.frame; over > 0 {
 		r.down = r.down[over:]
 		r.dropped.Add(int64(over))
 	}
@@ -317,8 +401,10 @@ func (r *sipRTP) sender() {
 	defer t.Stop()
 	var seq uint16 = uint16(r.ssrc)
 	var ts uint32 = r.ssrc ^ 0x5a5a5a5a
-	pkt := make([]byte, 12+rtpFrame)
-	frame := make([]float32, rtpFrame)
+	pkt := make([]byte, 12, 12+bbOpusMaxPkt)
+	frame := make([]float32, r.frame)
+	pcm := make([]int16, r.frame)
+	tsStep := uint32(r.codec.Clock / 50)
 	for {
 		select {
 		case <-r.stop:
@@ -326,12 +412,12 @@ func (r *sipRTP) sender() {
 		case <-t.C:
 		}
 		r.mu.Lock()
-		if !r.started && len(r.down) >= rtpPrebuffer {
+		if !r.started && len(r.down) >= rtpPrebufferFrames*r.frame {
 			r.started = true
 		}
-		if r.started && len(r.down) >= rtpFrame {
-			copy(frame, r.down[:rtpFrame])
-			r.down = r.down[rtpFrame:]
+		if r.started && len(r.down) >= r.frame {
+			copy(frame, r.down[:r.frame])
+			r.down = r.down[r.frame:]
 		} else {
 			if r.started {
 				r.underruns.Add(1)
@@ -342,21 +428,35 @@ func (r *sipRTP) sender() {
 			}
 		}
 		r.mu.Unlock()
+		pkt = pkt[:12]
 		pkt[0] = 0x80
-		pkt[1] = 0 // PCMU
+		pkt[1] = byte(r.codec.PT)
 		binary.BigEndian.PutUint16(pkt[2:], seq)
 		binary.BigEndian.PutUint32(pkt[4:], ts)
 		binary.BigEndian.PutUint32(pkt[8:], r.ssrc)
-		for i, v := range frame {
-			pkt[12+i] = ulawEncode(floatToInt16(v))
+		ok := true
+		if r.codec.Opus {
+			for i, v := range frame {
+				pcm[i] = floatToInt16(v)
+			}
+			var err error
+			if r.enc == nil {
+				ok = false
+			} else if pkt, err = r.enc.encode(pcm, pkt); err != nil {
+				ok = false // a lost packet: seq and ts still move on
+			}
+		} else {
+			for _, v := range frame {
+				pkt = append(pkt, ulawEncode(floatToInt16(v)))
+			}
 		}
-		if dst := r.remote.Load(); dst != nil {
+		if dst := r.remote.Load(); ok && dst != nil {
 			if _, err := r.conn.WriteTo(pkt, dst); err == nil {
 				r.sent.Add(1)
 			}
 		}
 		seq++
-		ts += rtpFrame
+		ts += tsStep
 	}
 }
 
@@ -378,7 +478,7 @@ func (r *sipRTP) receiver() {
 			continue
 		}
 		payload, pt, ok := rtpPayload(buf[:n])
-		if !ok || pt != 0 {
+		if !ok || pt != r.codec.PT {
 			continue // e.g. the engine's firewall probes (PT 127) or RTCP
 		}
 		if !latched { // symmetric RTP: answer where the phone really sends from
@@ -389,6 +489,23 @@ func (r *sipRTP) receiver() {
 			}
 		}
 		r.recv.Add(1)
+		if r.codec.Opus {
+			if r.dec == nil {
+				continue
+			}
+			pcm, err := r.dec.decode(payload)
+			if err != nil {
+				continue
+			}
+			up := make([]float32, len(pcm))
+			for i, v := range pcm {
+				up[i] = float32(v) / 32768
+			}
+			if r.onUp != nil {
+				r.onUp(up)
+			}
+			continue
+		}
 		pcm8 := make([]float32, len(payload))
 		for i, u := range payload {
 			pcm8[i] = float32(ulawDecode(u)) / 32768

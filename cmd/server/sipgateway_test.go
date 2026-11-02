@@ -484,3 +484,100 @@ func TestTunnelRegistrationSurvivesRestart(t *testing.T) {
 		t.Fatalf("state file not removed: %v", err)
 	}
 }
+
+func TestPickCodecPrefersTheEnginesOpusWB(t *testing.T) {
+	eng, err := parseSDP([]byte("v=0\r\nc=IN IP4 192.168.1.72\r\nm=audio 45536 RTP/AVP 126 0\r\n" +
+		"a=rtpmap:126 OPUS/16000\r\na=rtpmap:0 PCMU/8000\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := eng.pickCodec(true); !ok || c != codecOpusWB {
+		t.Fatalf("opus allowed: %v %v", c, ok)
+	}
+	if c, ok := eng.pickCodec(false); !ok || c != codecPCMU {
+		t.Fatalf("opus off: %v %v", c, ok)
+	}
+	std, _ := parseSDP([]byte("v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 5000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n"))
+	if c, ok := std.pickCodec(true); !ok || c != (sipCodec{PT: 111, Opus: true, Clock: 48000}) {
+		t.Fatalf("RFC 7587 opus: %v %v", c, ok)
+	}
+	speex, _ := parseSDP([]byte("v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 5000 RTP/AVP 102\r\na=rtpmap:102 SPEEX/16000\r\n"))
+	if _, ok := speex.pickCodec(true); ok {
+		t.Fatal("speex only: no codec of ours")
+	}
+}
+
+func TestBuildSDPOffersOpusThenPCMU(t *testing.T) {
+	b := buildSDP("127.0.0.1", 40000, 7, false, codecOpusWB, codecPCMU)
+	for _, want := range []string{"m=audio 40000 RTP/AVP 126 0\r\n", "a=rtpmap:126 OPUS/16000\r\n", "a=rtpmap:0 PCMU/8000\r\n"} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("missing %q in\n%s", want, b)
+		}
+	}
+	s, _ := parseSDP(b)
+	if c, ok := s.pickCodec(true); !ok || c != codecOpusWB {
+		t.Fatalf("our own offer read back: %v %v", c, ok)
+	}
+}
+
+func TestSIPRTPOpusRoundTrip(t *testing.T) {
+	sent := make(chan []byte, 256)
+	tr := newTunnelRTP(func(_ int, p []byte) bool {
+		sent <- append([]byte(nil), p...)
+		return true
+	})
+	got := make(chan int, 16)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := newSIPRTP(tr, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45536}, codecOpusWB,
+		func(pcm []float32) { got <- len(pcm) }, log)
+	r.start()
+	defer r.close()
+	tone := make([]float32, 16000*400/1000)
+	for i := range tone {
+		tone[i] = 0.3 * float32(math.Sin(2*math.Pi*440*float64(i)/16000))
+	}
+	_ = r.WritePCM(tone)
+
+	dec, err := newBBOpusDecoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.close()
+	var prevTS uint32
+	var first []byte
+	for n := 0; n < 6; n++ {
+		var p []byte
+		select {
+		case p = <-sent:
+		case <-time.After(2 * time.Second):
+			t.Fatal("no RTP sent")
+		}
+		if pt := int(p[1] & 0x7f); pt != 126 {
+			t.Fatalf("payload type %d", pt)
+		}
+		ts := binary.BigEndian.Uint32(p[4:])
+		if n > 0 && ts-prevTS != 320 {
+			t.Fatalf("timestamp step %d, want 320 (20 ms at 16 kHz)", ts-prevTS)
+		}
+		prevTS = ts
+		pcm, err := dec.decode(p[12:])
+		if err != nil || len(pcm) != 320 {
+			t.Fatalf("decode: %d samples, %v", len(pcm), err)
+		}
+		if first == nil {
+			first = p
+		}
+	}
+	if len(first)-12 > 120 {
+		t.Fatalf("opus packet of %d bytes: not the ~60 of 24 kbit/s", len(first)-12)
+	}
+	tr.deliver(45536, first) // the phone's packets decode the same way
+	select {
+	case n := <-got:
+		if n != 320 {
+			t.Fatalf("uplink %d samples", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("received Opus not decoded")
+	}
+}

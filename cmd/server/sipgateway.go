@@ -71,6 +71,8 @@ type sipConfig struct {
 	// still holds its connection to the relay and won't register again for
 	// up to sipTunnelExpires, so without it incoming calls miss the phone.
 	StateFile string
+	// Opus: offer and accept Opus (the engine's OPUS-WB, 16 kHz) before PCMU.
+	Opus bool
 }
 
 // sipTunnelState is StateFile's content.
@@ -133,6 +135,7 @@ type sipCall struct {
 	target     string // where in-dialog requests go (the phone's Contact)
 	cseq       int    // our next CSeq in this dialog
 	offer      *sdpAudio
+	codec      sipCodec // the call's audio, from the SDP exchange
 	rtp        *sipRTP
 	pacer      *bbUpPacer
 	mediaIP    string
@@ -151,6 +154,14 @@ func newSIPGateway(be sipBackend, broker *Broker, cfg sipConfig, log *slog.Logge
 		calls: map[string]*sipCall{}, dialog: map[string]*sipCall{}}
 	g.loadTunnelState(time.Now())
 	return g
+}
+
+// offerCodecs: what we offer the phone, in preference order.
+func (g *sipGateway) offerCodecs() []sipCodec {
+	if g.cfg.Opus {
+		return []sipCodec{codecOpusWB, codecPCMU}
+	}
+	return []sipCodec{codecPCMU}
 }
 
 // loadTunnelState restores the last registration over the link if it is
@@ -484,7 +495,7 @@ func (g *sipGateway) ringPhone(waID, peerJID string) {
 	inv.Add("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS")
 	inv.Add("User-Agent", "WaCalls")
 	inv.Add("Content-Type", "application/sdp")
-	inv.Body = buildSDP(ip, port, c.sessionID, false)
+	inv.Body = buildSDP(ip, port, c.sessionID, false, g.offerCodecs()...)
 	c.invite = inv
 	g.mu.Lock()
 	g.calls[waID] = c
@@ -543,13 +554,18 @@ func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
 	c.state = sipActive
 	g.mu.Unlock()
 	ans, err := parseSDP(m.Body)
-	if err != nil || !ans.hasPCMU() {
-		g.log.Warn("phone answered without PCMU", "err", err)
+	codec, ok := codecPCMU, false
+	if err == nil {
+		codec, ok = ans.pickCodec(g.cfg.Opus)
+	}
+	if !ok {
+		g.log.Warn("phone answered without a codec we offered", "err", err)
 		g.sendBye(c)
 		g.forget(c)
 		g.be.Hangup(ctx, c.waID)
 		return
 	}
+	c.codec = codec
 	g.startMedia(c, ans)
 	if err := g.be.Accept(ctx, c.waID); err != nil {
 		g.log.Warn("accepting the WhatsApp call failed", "call_id", c.waID, "err", err)
@@ -660,7 +676,7 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 			port = existing.pendingRTP.LocalPort()
 		}
 		offer, _ := parseSDP(m.Body)
-		r.Body = buildSDP(existing.mediaIP, port, existing.sessionID+1, offer != nil && offer.Video)
+		r.Body = buildSDP(existing.mediaIP, port, existing.sessionID+1, offer != nil && offer.Video, existing.codec)
 		_ = p.send(r)
 		return
 	}
@@ -670,7 +686,11 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 		return
 	}
 	offer, err := parseSDP(m.Body)
-	if err != nil || !offer.hasPCMU() {
+	codec, ok := codecPCMU, false
+	if err == nil {
+		codec, ok = offer.pickCodec(g.cfg.Opus)
+	}
+	if !ok {
 		_ = p.send(sipResponse(m, 488, "Not Acceptable Here", sipRandom(4)))
 		return
 	}
@@ -689,7 +709,7 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 		return
 	}
 	c := &sipCall{sipID: m.Get("call-id"), phone: p, localTag: sipRandom(6), invite: m,
-		target: sipAddrURI(m.Get("contact")), cseq: 1, offer: offer, mediaIP: ip,
+		target: sipAddrURI(m.Get("contact")), cseq: 1, offer: offer, codec: codec, mediaIP: ip,
 		sessionID: time.Now().Unix(), pendingRTP: conn}
 	g.mu.Lock()
 	g.dialog[c.sipID] = c
@@ -724,7 +744,7 @@ func (g *sipGateway) waConnected(waID string) {
 	r.Add("Contact", fmt.Sprintf("<sip:wacalls@%s;transport=tcp>", c.mediaIP))
 	r.Add("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS")
 	r.Add("Content-Type", "application/sdp")
-	r.Body = buildSDP(c.mediaIP, port, c.sessionID, c.offer.Video)
+	r.Body = buildSDP(c.mediaIP, port, c.sessionID, c.offer.Video, c.codec)
 	g.startMedia(c, c.offer)
 	_ = c.phone.send(r)
 	g.log.Info("whatsapp peer answered", "call_id", waID)
@@ -768,13 +788,13 @@ func (g *sipGateway) startMedia(c *sipCall, remote *sdpAudio) {
 	dst := &net.UDPAddr{IP: net.ParseIP(remote.IP), Port: remote.Port}
 	waID := c.waID
 	pacer := newBBUpPacer(func(pcm []float32) { g.be.Feed(waID, pcm) })
-	rtp := newSIPRTP(c.pendingRTP, dst, pacer.push, g.log.With("call_id", waID))
+	rtp := newSIPRTP(c.pendingRTP, dst, c.codec, pacer.push, g.log.With("call_id", waID))
 	g.mu.Lock()
 	c.rtp, c.pacer, c.pendingRTP = rtp, pacer, nil
 	g.mu.Unlock()
 	rtp.start()
 	g.be.Attach(waID, rtp)
-	g.log.Info("sip media", "call_id", waID, "local_port", rtp.localPort(), "phone", dst, "tunnel", c.phone.newMedia != nil)
+	g.log.Info("sip media", "call_id", waID, "codec", c.codec.String(), "local_port", rtp.localPort(), "phone", dst, "tunnel", c.phone.newMedia != nil)
 }
 
 func (g *sipGateway) forget(c *sipCall) {

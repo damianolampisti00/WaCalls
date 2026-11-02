@@ -31,6 +31,7 @@ func main() {
 	sipMediaIP := flag.String("sip-media-ip", "", "IP for RTP (empty = the phone connection's local address)")
 	sipRTPPorts := flag.String("sip-rtp-ports", "40000-40099", "RTP port range")
 	sipAllow := flag.String("sip-allow", "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16", "networks allowed to connect to the SIP gateway")
+	sipOpus := flag.Bool("sip-opus", true, "SIP gateway: offer and accept Opus (the phone engine's OPUS-WB) before PCMU")
 	waVideo := flag.Bool("wa-video", false, "1:1 video stanzas of the clients that render video (h.264/H264, see signaling.VideoSignaling); off = legacy shapes")
 	flag.Parse()
 	signaling.VideoSignaling = *waVideo
@@ -86,7 +87,7 @@ func main() {
 		be := &sessionBackend{sessions: srv.sessions, broker: srv.broker, sessionID: *bbSession}
 		sipGW = newSIPGateway(be, srv.broker, sipConfig{Domain: *sipDomain, MediaIP: *sipMediaIP,
 			RTPLo: lo, RTPHi: hi, Allow: allow,
-			StateFile: filepath.Join(filepath.Dir(*dbPath), "sip_tunnel.json")}, log)
+			StateFile: filepath.Join(filepath.Dir(*dbPath), "sip_tunnel.json"), Opus: *sipOpus}, log)
 		go func() {
 			log.Info("SIP gateway listening", "addr", *sipAddr)
 			if err := sipGW.serve(ctx, ln); err != nil {
