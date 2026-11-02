@@ -84,16 +84,30 @@ func main() {
 			log.Error("bad -sip-allow", "err", err)
 			os.Exit(1)
 		}
-		ln, err := net.Listen("tcp", *sipAddr)
-		if err != nil {
-			log.Error("SIP gateway listen failed", "err", err)
-			os.Exit(1)
-		}
 		be := &sessionBackend{sessions: srv.sessions, broker: srv.broker, sessionID: *bbSession}
 		sipGW = newSIPGateway(be, srv.broker, sipConfig{Domain: *sipDomain, MediaIP: *sipMediaIP,
 			RTPLo: lo, RTPHi: hi, Allow: allow,
 			StateFile: filepath.Join(filepath.Dir(*dbPath), "sip_tunnel.json"), Opus: *sipOpus, DelayedOffer: *sipDelayed}, log)
 		go func() {
+			// At boot the LAN address may not be up yet (pm2 starts after
+			// network.target): wait for it instead of exiting, or pm2 gives
+			// up after a burst of quick restarts and nothing runs.
+			var ln net.Listener
+			for warned := false; ; {
+				var err error
+				if ln, err = net.Listen("tcp", *sipAddr); err == nil {
+					break
+				}
+				if !warned {
+					log.Warn("SIP gateway: address not available yet, retrying every 2 s", "addr", *sipAddr, "err", err)
+					warned = true
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+			}
 			log.Info("SIP gateway listening", "addr", *sipAddr)
 			if err := sipGW.serve(ctx, ln); err != nil {
 				log.Error("SIP gateway error", "err", err)
