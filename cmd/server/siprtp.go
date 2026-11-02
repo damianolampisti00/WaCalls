@@ -464,6 +464,8 @@ func (r *sipRTP) receiver() {
 	defer r.wg.Done()
 	buf := make([]byte, 2048)
 	var latched bool
+	start := time.Now()
+	others := 0
 	for {
 		n, from, err := r.conn.ReadFrom(buf)
 		if err != nil {
@@ -479,10 +481,19 @@ func (r *sipRTP) receiver() {
 		}
 		payload, pt, ok := rtpPayload(buf[:n])
 		if !ok || pt != r.codec.PT {
-			continue // e.g. the engine's firewall probes (PT 127) or RTCP
+			// e.g. the engine's firewall probes (PT 127) or RTCP. The first
+			// few are logged: the engine starts its audio only ~5 s after
+			// the answer, once its connectivity check gives up or succeeds.
+			if others < 12 {
+				others++
+				r.log.Info("sip rtp other packet", "after_ms", time.Since(start).Milliseconds(), "pt", pt,
+					"len", n, "from", from, "head", fmt.Sprintf("% x", buf[:min(n, 32)]))
+			}
+			continue
 		}
 		if !latched { // symmetric RTP: answer where the phone really sends from
 			latched = true
+			r.log.Info("sip rtp first audio", "after_ms", time.Since(start).Milliseconds())
 			if cur := r.remote.Load(); cur == nil || cur.String() != from.String() {
 				r.log.Info("sip rtp remote latched", "sdp", cur, "actual", from)
 				r.remote.Store(from)
