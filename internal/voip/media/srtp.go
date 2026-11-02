@@ -171,6 +171,8 @@ func (c *SrtpContext) computeAuthTag(data []byte, roc uint32, tagLen int) []byte
 type SrtpSession struct {
 	sendCtx *SrtpContext
 	recvCtx *SrtpContext
+	recvKey core.SrtpKeyingMaterial
+	recvTag int
 }
 
 func NewSrtpSession(sendKey, recvKey core.SrtpKeyingMaterial, sendAuthLen, recvAuthLen int) (*SrtpSession, error) {
@@ -182,7 +184,14 @@ func NewSrtpSession(sendKey, recvKey core.SrtpKeyingMaterial, sendAuthLen, recvA
 	if err != nil {
 		return nil, err
 	}
-	return &SrtpSession{sendCtx: sc, recvCtx: rc}, nil
+	return &SrtpSession{sendCtx: sc, recvCtx: rc, recvKey: recvKey, recvTag: recvAuthLen}, nil
+}
+
+// NewRecvContext: a receive context with the session's keys and its own
+// rollover counter, for another of the peer's streams (SRTP keeps one per
+// SSRC: the video's sequence numbers must not move the audio's ROC).
+func (s *SrtpSession) NewRecvContext() (*SrtpContext, error) {
+	return NewSrtpContext(s.recvKey, s.recvTag)
 }
 
 func (s *SrtpSession) Protect(packet *RtpPacket) ([]byte, error) { return s.sendCtx.Protect(packet) }

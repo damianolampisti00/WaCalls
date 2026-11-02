@@ -127,6 +127,10 @@ func (m *CallManager) onRelayData(data []byte) {
 		m.stats.report(m.log, false)
 	}
 	pt := data[1] & 0x7f
+	if pt == core.PayloadTypeWhatsAppH264 {
+		m.onPeerVideoRTP(data)
+		return
+	}
 	// 122 ("mlow-1"): where a video call's peer moves MLOW (capability 38,
 	// enable_mlow_separate_pt_tx); read exactly like 120.
 	if pt != core.PayloadTypeWhatsAppOpus && pt != core.PayloadTypeWhatsAppMLowSeparate {
@@ -171,4 +175,38 @@ func (m *CallManager) onRelayData(data []byte) {
 	if m.OnPeerAudio != nil {
 		m.OnPeerAudio(pcm)
 	}
+}
+
+// onPeerVideoRTP decrypts one of the peer's video packets with that
+// stream's own SRTP context (same keys as the audio, own ROC per SSRC).
+func (m *CallManager) onPeerVideoRTP(data []byte) {
+	if m.OnPeerVideo == nil {
+		return
+	}
+	ssrc := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])
+	m.mu.Lock()
+	sess := m.srtpSession
+	if sess == nil || ssrc == m.selfSsrc {
+		m.mu.Unlock()
+		return
+	}
+	if m.videoSess != sess {
+		m.videoSess, m.videoRecv = sess, map[uint32]*media.SrtpContext{}
+	}
+	ctx := m.videoRecv[ssrc]
+	if ctx == nil {
+		var err error
+		if ctx, err = sess.NewRecvContext(); err != nil {
+			m.mu.Unlock()
+			return
+		}
+		m.videoRecv[ssrc] = ctx
+		m.log.Info("peer video stream", "ssrc", ssrc)
+	}
+	m.mu.Unlock()
+	pkt, err := ctx.Unprotect(data)
+	if err != nil || len(pkt.Payload) == 0 {
+		return
+	}
+	m.OnPeerVideo(pkt)
 }

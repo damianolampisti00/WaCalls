@@ -23,8 +23,11 @@ type CallManager struct {
 
 	rtpSession  *media.RtpSession
 	srtpSession *media.SrtpSession
-	codec       media.Codec
-	relay       RelayTransport
+	// the peer's video streams: one receive context per SSRC, for videoSess
+	videoSess *media.SrtpSession
+	videoRecv map[uint32]*media.SrtpContext
+	codec     media.Codec
+	relay     RelayTransport
 
 	selfSsrc      uint32
 	peerSsrcs     []uint32
@@ -47,6 +50,9 @@ type CallManager struct {
 	OnIncoming    func(*CallInfo)
 	OnEnded       func(*CallInfo)
 	OnPeerAudio   func([]float32)
+	// OnPeerVideo: one decrypted RTP packet of the peer's video (H.264,
+	// payload type 97); called from the relay's receive path.
+	OnPeerVideo func(*media.RtpPacket)
 	// OnSentPCM gets each frame sent to the peer (captured audio or the
 	// keep-alive silence), in order: an echo canceller's reference.
 	OnSentPCM func([]float32)

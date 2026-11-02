@@ -33,9 +33,11 @@ func main() {
 	sipAllow := flag.String("sip-allow", "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16", "networks allowed to connect to the SIP gateway")
 	sipOpus := flag.Bool("sip-opus", true, "SIP gateway: offer and accept Opus (the phone engine's OPUS-WB) before PCMU")
 	sipDelayed := flag.Bool("sip-delayed-offer", true, "SIP gateway, with -sip-opus: ring the phone without SDP so its engine offers (and picks Opus); refused: ring again with our offer")
+	waVideoDump := flag.String("wa-video-dump", "", "directory where each call's received WhatsApp video is written as Annex-B H.264 (empty = off)")
 	waVideo := flag.Bool("wa-video", false, "1:1 video stanzas of the clients that render video (h.264/H264, see signaling.VideoSignaling); off = legacy shapes")
 	flag.Parse()
 	signaling.VideoSignaling = *waVideo
+	videoDumpDir = *waVideoDump
 
 	level := slog.LevelInfo
 	if *debug {

@@ -9,6 +9,7 @@ import (
 
 	"wacalls/internal/voip/call"
 	"wacalls/internal/voip/core"
+	"wacalls/internal/voip/media"
 	"wacalls/internal/voip/signaling"
 	"wacalls/internal/voip/wanode"
 	"wacalls/internal/wa"
@@ -83,7 +84,33 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		s.mgr.broker.upsertCall(rec)
 	}
+	var dumpMu sync.Mutex
+	dumps := map[uint32]*videoDump{}
+	if videoDumpDir != "" {
+		cm.OnPeerVideo = func(p *media.RtpPacket) {
+			dumpMu.Lock()
+			d, ok := dumps[p.Header.Ssrc]
+			if !ok {
+				var err error
+				if d, err = newVideoDump(callID, p.Header.Ssrc); err != nil {
+					s.log.Warn("video dump", "err", err)
+				}
+				dumps[p.Header.Ssrc] = d
+			}
+			dumpMu.Unlock()
+			if d != nil {
+				d.push(p.Header.SequenceNumber, p.Header.Timestamp, p.Header.Marker, p.Payload)
+			}
+		}
+	}
 	cm.OnEnded = func(c *call.CallInfo) {
+		dumpMu.Lock()
+		for _, d := range dumps {
+			if d != nil {
+				d.close(s.log)
+			}
+		}
+		dumpMu.Unlock()
 		s.removeCall(c.CallID)
 		s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 	}
