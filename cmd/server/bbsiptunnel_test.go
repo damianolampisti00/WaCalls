@@ -164,3 +164,18 @@ func TestSIPOverTheBerryBridgeLink(t *testing.T) {
 	p2.text(`{"type":"sip.open","resume":true}`)
 	waitFor(t, "registration resumed", sipGW.registered)
 }
+
+func TestTunnelLagExcessOverMinimum(t *testing.T) {
+	var l tunnelLag
+	// Phone clock 1000 ms behind ours, first frame 30 ms in transit.
+	l.note(nil, 0, 1030, 0)
+	l.note(nil, 20, 1040, 2) // faster: the new minimum
+	l.note(nil, 40, 1060, 1)
+	if l.lag != 0 || l.maxLag != 0 {
+		t.Fatalf("lag %d max %d, want 0 and 0 (each frame against the minimum known then)", l.lag, l.maxLag)
+	}
+	l.note(nil, 60, 3080, 5) // 2 s queued on the way
+	if l.lag != 2000 || l.maxLag != 2000 || l.maxOutQ != 5 {
+		t.Fatalf("lag %d max %d outQ max %d, want 2000 2000 5", l.lag, l.maxLag, l.maxOutQ)
+	}
+}

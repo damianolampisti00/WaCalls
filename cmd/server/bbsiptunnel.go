@@ -20,6 +20,7 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -46,10 +47,49 @@ type tunnelRTP struct {
 	send func(dstPort int, p []byte) bool
 	done chan struct{}
 	once sync.Once
+	lag  tunnelLag
 }
 
 func newTunnelRTP(send func(int, []byte) bool) *tunnelRTP {
 	return &tunnelRTP{port: bbTunnelRTPPort, in: make(chan tunnelPkt, 64), send: send, done: make(chan struct{})}
+}
+
+// tunnelLag measures how late the phone's RTP reaches us: each frame carries
+// the phone's clock ([8:12], ms), so arrival minus that clock is the transit
+// time plus a constant; its excess over the smallest value seen in the call
+// is audio queued on the way (phone socket, Cloudflare, the link). Also the
+// fill of the link's outgoing queue, for the other direction.
+type tunnelLag struct {
+	mu            sync.Mutex
+	minOff        int64
+	n             int
+	lag, maxLag   int64
+	outQ, maxOutQ int
+	lastLog       time.Time
+}
+
+const tunnelLagEvery = 5 * time.Second
+
+// note records one phone frame (phoneMs: its clock; ourMs: ours, same unit).
+func (l *tunnelLag) note(log *slog.Logger, phoneMs uint32, ourMs int64, outQ int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	off := ourMs - int64(phoneMs)
+	if l.n == 0 || off < l.minOff {
+		l.minOff = off
+	}
+	l.n++
+	l.lag = off - l.minOff
+	l.maxLag = max(l.maxLag, l.lag)
+	l.outQ = outQ
+	l.maxOutQ = max(l.maxOutQ, outQ)
+	now := time.Now()
+	if log != nil && now.Sub(l.lastLog) >= tunnelLagEvery {
+		l.lastLog = now
+		log.Info("tunnel rtp lag", "frames", l.n, "up_lag_ms", l.lag, "up_lag_max_ms", l.maxLag,
+			"down_queue", outQ, "down_queue_max", l.maxOutQ)
+		l.maxOutQ = 0
+	}
 }
 
 func (t *tunnelRTP) WriteTo(p []byte, dst *net.UDPAddr) (int, error) {
@@ -192,6 +232,7 @@ func (g *bbGateway) onTunnelFrame(c *bbConn, frame []byte) bool {
 		return true
 	}
 	if r := t.rtp.Load(); r != nil {
+		r.lag.note(g.log, binary.LittleEndian.Uint32(frame[8:12]), time.Since(c.start).Milliseconds(), len(c.out))
 		r.deliver(int(binary.LittleEndian.Uint16(frame[2:4])), append([]byte(nil), payload...))
 	}
 	return true
