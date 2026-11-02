@@ -41,6 +41,7 @@ type CallManager struct {
 
 	lastCaptureAt time.Time
 	keepaliveStop chan struct{}
+	stats         rtpStats // what the relay delivers (rtpstats.go)
 
 	OnStateChange func(*CallInfo)
 	OnIncoming    func(*CallInfo)

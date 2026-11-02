@@ -122,8 +122,14 @@ func (m *CallManager) onRelayData(data []byte) {
 	if len(data) < 12 {
 		return
 	}
+	m.stats.add(data)
+	if m.stats.due() {
+		m.stats.report(m.log, false)
+	}
 	pt := data[1] & 0x7f
-	if pt != core.PayloadTypeWhatsAppOpus {
+	// 122 ("mlow-1"): where a video call's peer moves MLOW (capability 38,
+	// enable_mlow_separate_pt_tx); read exactly like 120.
+	if pt != core.PayloadTypeWhatsAppOpus && pt != core.PayloadTypeWhatsAppMLowSeparate {
 		return
 	}
 

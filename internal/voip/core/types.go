@@ -41,6 +41,8 @@ const (
 
 const (
 	PayloadTypeWhatsAppOpus = 120
+	// MLOW on its separate payload type ("mlow-1"), used by a video call's peer.
+	PayloadTypeWhatsAppMLowSeparate = 122
 )
 
 const (

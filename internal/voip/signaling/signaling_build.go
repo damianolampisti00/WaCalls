@@ -13,7 +13,43 @@ import (
 var (
 	capabilityOffer     = []byte{0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x07}
 	capabilityPreaccept = []byte{0x01, 0x05, 0xff, 0x09, 0xe4, 0xbb, 0x07}
+
+	// The blobs of the clients that get 1:1 video to render (whatsapp-rust
+	// 3357b5f, wacore/src/stanza/call.rs): a video offer carries ...bb 53, a
+	// video callee preaccepts with ...bb 13.
+	capabilityVideoOffer     = []byte{0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x53}
+	capabilityVideoPreaccept = []byte{0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13}
 )
+
+// VideoSignaling selects the 1:1 video stanzas that real clients render
+// (whatsapp-rust 3357b5f, meowcaller c48c3e2): <video enc="h.264" dec="H264">
+// with no geometry (0x0 is the 1:1 shape; 1920x1080 is the group-call one and
+// leaves the callee never rendering), no "orientation" attribute, right after
+// the <audio> children. WhatsApp Web's parser accepts enc "h.264" or
+// "vp8/h.264" only; the dotless or "vp8" spellings sent before were delivered
+// and acked but never rang or never rendered.
+//
+// Off (the default): the legacy shapes below, unchanged, because a peer that
+// takes a correct video advertisement at its word starts sending video and
+// carries most of its audio inside the video packets, which the media path
+// does not read yet.
+var VideoSignaling bool
+
+func videoOfferNode() waBinary.Node {
+	return waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{
+		"enc": "h.264", "dec": "H264", "screen_width": "0", "screen_height": "0", "device_orientation": "0",
+	}}
+}
+
+func videoPreacceptNode() waBinary.Node {
+	return waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{
+		"dec": "H264", "device_orientation": "0", "screen_width": "0", "screen_height": "0",
+	}}
+}
+
+func videoAcceptNode() waBinary.Node {
+	return waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{"dec": "H264", "device_orientation": "0"}}
+}
 
 func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, callKey []byte, peerJid types.JID, isVideo bool) (waBinary.Node, error) {
 	creator := sock.OwnLID()
@@ -44,7 +80,11 @@ func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, 
 		waBinary.Node{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "8000"}},
 		waBinary.Node{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "16000"}},
 	)
-	if isVideo {
+	capability := capabilityOffer
+	if isVideo && VideoSignaling {
+		offerContent = append(offerContent, videoOfferNode())
+		capability = capabilityVideoOffer
+	} else if isVideo {
 		offerContent = append(offerContent, waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{
 			"enc": "vp8", "dec": "vp8", "orientation": "0",
 			"screen_width": "1920", "screen_height": "1080", "device_orientation": "0",
@@ -52,7 +92,7 @@ func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, 
 	}
 	offerContent = append(offerContent,
 		waBinary.Node{Tag: "net", Attrs: waBinary.Attrs{"medium": "3"}},
-		waBinary.Node{Tag: "capability", Attrs: waBinary.Attrs{"ver": "1"}, Content: capabilityOffer},
+		waBinary.Node{Tag: "capability", Attrs: waBinary.Attrs{"ver": "1"}, Content: capability},
 		waBinary.Node{Tag: "destination", Content: destinations},
 		waBinary.Node{Tag: "encopt", Attrs: waBinary.Attrs{"keygen": "2"}},
 	)
@@ -88,18 +128,21 @@ func BuildAcceptStanza(ctx context.Context, sock core.VoipSocket, callID string,
 		return waBinary.Node{}, fmt.Errorf("no enc node produced for accept")
 	}
 
-	acceptContent := []waBinary.Node{
-		{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "16000"}},
-		{Tag: "net", Attrs: waBinary.Attrs{"medium": "3"}},
-		*encNode,
-		{Tag: "encopt", Attrs: waBinary.Attrs{"keygen": "2"}},
+	acceptContent := []waBinary.Node{{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "16000"}}}
+	if isVideo && VideoSignaling { // order: audio -> video -> net ... (whatsapp-rust build_accept)
+		acceptContent = append(acceptContent, videoAcceptNode())
 	}
+	acceptContent = append(acceptContent,
+		waBinary.Node{Tag: "net", Attrs: waBinary.Attrs{"medium": "3"}},
+		*encNode,
+		waBinary.Node{Tag: "encopt", Attrs: waBinary.Attrs{"keygen": "2"}},
+	)
 	if includeDeviceIdentity {
 		if di, ok := sock.AccountDeviceIdentityNode(); ok {
 			acceptContent = append(acceptContent, di)
 		}
 	}
-	if isVideo {
+	if isVideo && !VideoSignaling {
 		acceptContent = append(acceptContent, waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{"enc": "vp8"}})
 	}
 
@@ -144,18 +187,25 @@ func BuildRejectStanza(peerJid types.JID, callID string, callCreator types.JID) 
 	})
 }
 
-func BuildPreacceptStanza(peerJid types.JID, callID string, callCreator types.JID) waBinary.Node {
+// BuildPreacceptStanza: audio -> [video] -> encopt -> capability.
+func BuildPreacceptStanza(peerJid types.JID, callID string, callCreator types.JID, isVideo bool) waBinary.Node {
+	content := []waBinary.Node{{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "16000"}}}
+	capability := capabilityPreaccept
+	if isVideo && VideoSignaling {
+		content = append(content, videoPreacceptNode())
+		capability = capabilityVideoPreaccept
+	}
+	content = append(content,
+		waBinary.Node{Tag: "encopt", Attrs: waBinary.Attrs{"keygen": "2"}},
+		waBinary.Node{Tag: "capability", Attrs: waBinary.Attrs{"ver": "1"}, Content: capability},
+	)
 	return waBinary.Node{
 		Tag:   "call",
 		Attrs: waBinary.Attrs{"to": peerJid, "id": GenerateCallStanzaID()},
 		Content: []waBinary.Node{{
-			Tag:   "preaccept",
-			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": callCreator},
-			Content: []waBinary.Node{
-				{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "16000"}},
-				{Tag: "encopt", Attrs: waBinary.Attrs{"keygen": "2"}},
-				{Tag: "capability", Attrs: waBinary.Attrs{"ver": "1"}, Content: capabilityPreaccept},
-			},
+			Tag:     "preaccept",
+			Attrs:   waBinary.Attrs{"call-id": callID, "call-creator": callCreator},
+			Content: content,
 		}},
 	}
 }

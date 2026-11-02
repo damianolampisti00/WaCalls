@@ -76,6 +76,7 @@ func (m *CallManager) connectRelays(endpoints []core.RelayEndpoint) {
 }
 
 func (m *CallManager) cleanupMedia() {
+	m.stats.report(m.log, true)
 	m.mu.Lock()
 	codec := m.codec
 	m.codec = nil
