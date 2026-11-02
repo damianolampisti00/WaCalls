@@ -261,6 +261,11 @@ func (m *CallManager) HandleCallAck(ctx context.Context, node *waBinary.Node) {
 }
 
 func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
+	if node != nil {
+		// Who ended it, and how: the reason alone does not tell a peer
+		// device from one of our own or the server.
+		m.log.Info("call terminate stanza", "xml", node.String())
+	}
 	m.mu.Lock()
 	call := m.currentCall
 	if call == nil {
