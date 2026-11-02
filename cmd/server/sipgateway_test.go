@@ -253,11 +253,15 @@ func (p *fakePhone) readRTP() ([]byte, *net.UDPAddr) {
 	return buf[:n], from
 }
 
-func startSIPTest(t *testing.T) (*sipGateway, *fakeBackend, *Broker, *fakePhone) {
+func startSIPTest(t *testing.T, opts ...func(*sipConfig)) (*sipGateway, *fakeBackend, *Broker, *fakePhone) {
 	t.Helper()
 	be := &fakeBackend{}
 	broker := NewBroker()
-	gw := newSIPGateway(be, broker, sipConfig{MediaIP: "127.0.0.1", RTPLo: 41000, RTPHi: 41099}, slog.Default())
+	cfg := sipConfig{MediaIP: "127.0.0.1", RTPLo: 41000, RTPHi: 41099}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	gw := newSIPGateway(be, broker, cfg, slog.Default())
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -579,5 +583,84 @@ func TestSIPRTPOpusRoundTrip(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("received Opus not decoded")
+	}
+}
+
+func opusDelayed(c *sipConfig) { c.Opus, c.DelayedOffer = true, true }
+
+// engineOffer: the engine's own SDP offer as on 2026-11-02 (OPUS-WB first).
+func (p *fakePhone) engineOffer() string {
+	port := p.rtp.LocalAddr().(*net.UDPAddr).Port
+	return fmt.Sprintf("v=0\r\no=Eyeball 1 1 IN IP4 127.0.0.1\r\nc=IN IP4 127.0.0.1\r\n"+
+		"m=audio %d RTP/AVP 126 0 101\r\na=rtpmap:126 OPUS/16000\r\na=rtpmap:0 PCMU/8000\r\n"+
+		"a=rtpmap:101 telephone-event/8000\r\n", port)
+}
+
+func TestSIPGatewayDelayedOfferGetsOpus(t *testing.T) {
+	_, be, broker, p := startSIPTest(t, opusDelayed)
+	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wa1", Direction: "inbound", Status: StatusRinging})
+	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net")
+
+	inv := p.read()
+	if inv.Method != "INVITE" || len(inv.Body) != 0 || inv.Get("content-type") != "" {
+		t.Fatalf("INVITE should carry no SDP: %s", inv.Bytes())
+	}
+	ok := sipResponse(inv, 200, "OK", "ph1")
+	ok.Add("Contact", "<sip:wacalls@127.0.0.1:18724;transport=tcp>")
+	ok.Add("Content-Type", "application/sdp")
+	ok.Body = []byte(p.engineOffer())
+	p.sendMsg(ok)
+	ack := p.read()
+	if ack.Method != "ACK" || ack.Get("cseq") != "1 ACK" {
+		t.Fatalf("ACK: %s", ack.Bytes())
+	}
+	ans, err := parseSDP(ack.Body)
+	if err != nil || len(ans.Formats) != 1 || ans.Formats[0] != 126 || ans.RTPMap[126] != "OPUS/16000" {
+		t.Fatalf("our answer in the ACK: %+v %v\n%s", ans, err, ack.Body)
+	}
+	waitFor(t, "accept", func() bool { defer be.lock()(); return len(be.accepted) == 1 && be.attached["wa1"] != nil })
+	be.mu.Lock()
+	br := be.attached["wa1"]
+	be.mu.Unlock()
+	for i := 0; i < 10; i++ {
+		_ = br.WritePCM(sipTone(800, 16000, 960))
+	}
+	if pkt, _ := p.readRTP(); pkt[1]&0x7f != 126 {
+		t.Fatalf("downlink payload type %d, want Opus 126", pkt[1]&0x7f)
+	}
+}
+
+func TestSIPGatewayDelayedOfferRefusedRingsAgainWithOffer(t *testing.T) {
+	_, be, broker, p := startSIPTest(t, opusDelayed)
+	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wa1", Direction: "inbound", Status: StatusRinging})
+	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net")
+
+	inv := p.read()
+	p.sendMsg(sipResponse(inv, 488, "Not Acceptable Here", "ph1"))
+	if ack := p.read(); ack.Method != "ACK" || ack.Get("cseq") != "1 ACK" {
+		t.Fatalf("ACK of the 488: %s", ack.Bytes())
+	}
+	inv2 := p.read()
+	if inv2.Method != "INVITE" || inv2.Get("cseq") != "2 INVITE" || inv2.Get("call-id") != inv.Get("call-id") {
+		t.Fatalf("second INVITE: %s", inv2.Bytes())
+	}
+	offer, err := parseSDP(inv2.Body)
+	if err != nil || len(offer.Formats) != 2 || offer.Formats[0] != 126 || !offer.hasPCMU() {
+		t.Fatalf("our offer: %+v %v", offer, err)
+	}
+	ok := sipResponse(inv2, 200, "OK", "ph2")
+	ok.Add("Contact", "<sip:wacalls@127.0.0.1:18724;transport=tcp>")
+	ok.Add("Content-Type", "application/sdp")
+	ok.Body = []byte(p.sdp()) // PCMU, as the engine answers
+	p.sendMsg(ok)
+	if ack := p.read(); ack.Method != "ACK" || ack.Get("cseq") != "2 ACK" || len(ack.Body) != 0 {
+		t.Fatalf("ACK: %s", ack.Bytes())
+	}
+	waitFor(t, "accept", func() bool { defer be.lock()(); return len(be.accepted) == 1 })
+	be.mu.Lock()
+	rejected := len(be.rejected)
+	be.mu.Unlock()
+	if rejected != 0 {
+		t.Fatal("the WhatsApp call was rejected on the 488")
 	}
 }

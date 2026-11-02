@@ -73,6 +73,12 @@ type sipConfig struct {
 	StateFile string
 	// Opus: offer and accept Opus (the engine's OPUS-WB, 16 kHz) before PCMU.
 	Opus bool
+	// DelayedOffer (with Opus): ring the phone with an INVITE without SDP.
+	// Answering an offer, the engine always picks PCMU (its "lawful access"
+	// codec choice, seen 2026-11-02, even with Opus offered first), while
+	// its own offers put OPUS-WB first: so it offers in the 200 OK and we
+	// answer in the ACK. Refused (4xx/6xx): we ring again with our offer.
+	DelayedOffer bool
 }
 
 // sipTunnelState is StateFile's content.
@@ -136,6 +142,9 @@ type sipCall struct {
 	cseq       int    // our next CSeq in this dialog
 	offer      *sdpAudio
 	codec      sipCodec // the call's audio, from the SDP exchange
+	delayed    bool     // our INVITE carried no SDP: the phone offers in its 200 OK
+	user       string   // our INVITE's From (calls to the phone)
+	display    string
 	rtp        *sipRTP
 	pacer      *bbUpPacer
 	mediaIP    string
@@ -476,11 +485,27 @@ func (g *sipGateway) ringPhone(waID, peerJID string) {
 	}
 	c := &sipCall{waID: waID, sipID: sipRandom(12) + "@" + g.cfg.Domain, fromUs: true, phone: p,
 		localTag: sipRandom(6), target: p.contact, cseq: 1, mediaIP: ip, sessionID: time.Now().Unix(), pendingRTP: conn}
-	port := conn.LocalPort()
+	c.user, c.display = user, display
+	c.delayed = g.cfg.Opus && g.cfg.DelayedOffer
+	g.mu.Lock()
+	g.calls[waID] = c
+	g.dialog[c.sipID] = c
+	g.mu.Unlock()
+	g.log.Info("ringing the phone", "call_id", waID, "from", display, "delayed_offer", c.delayed)
+	if err := g.sendInvite(c); err != nil {
+		g.log.Warn("INVITE to the phone failed", "err", err)
+		g.forget(c)
+	}
+}
+
+// sendInvite sends (or, with the next CSeq, sends again) our INVITE to the
+// phone: with our SDP offer, or none when c.delayed.
+func (g *sipGateway) sendInvite(c *sipCall) error {
+	p, ip := c.phone, c.mediaIP
 	inv := &sipMsg{Method: "INVITE", URI: p.contact}
 	inv.Add("Via", "SIP/2.0/TCP "+ip+";branch="+sipBranch())
 	inv.Add("Max-Forwards", "70")
-	inv.Add("From", fmt.Sprintf("\"%s\" <sip:%s@%s>;tag=%s", display, user, g.cfg.Domain, c.localTag))
+	inv.Add("From", fmt.Sprintf("\"%s\" <sip:%s@%s>;tag=%s", c.display, c.user, g.cfg.Domain, c.localTag))
 	to := p.aor
 	if to == "" {
 		to = "<" + p.contact + ">"
@@ -490,22 +515,16 @@ func (g *sipGateway) ringPhone(waID, peerJID string) {
 	}
 	inv.Add("To", to)
 	inv.Add("Call-ID", c.sipID)
-	inv.Add("CSeq", "1 INVITE")
-	inv.Add("Contact", fmt.Sprintf("<sip:%s@%s;transport=tcp>", user, ip))
+	inv.Add("CSeq", fmt.Sprintf("%d INVITE", c.cseq))
+	inv.Add("Contact", fmt.Sprintf("<sip:%s@%s;transport=tcp>", c.user, ip))
 	inv.Add("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS")
 	inv.Add("User-Agent", "WaCalls")
-	inv.Add("Content-Type", "application/sdp")
-	inv.Body = buildSDP(ip, port, c.sessionID, false, g.offerCodecs()...)
-	c.invite = inv
-	g.mu.Lock()
-	g.calls[waID] = c
-	g.dialog[c.sipID] = c
-	g.mu.Unlock()
-	g.log.Info("ringing the phone", "call_id", waID, "from", display)
-	if err := p.send(inv); err != nil {
-		g.log.Warn("INVITE to the phone failed", "err", err)
-		g.forget(c)
+	if !c.delayed {
+		inv.Add("Content-Type", "application/sdp")
+		inv.Body = buildSDP(ip, c.pendingRTP.LocalPort(), c.sessionID, false, g.offerCodecs()...)
 	}
+	c.invite = inv
+	return p.send(inv)
 }
 
 func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
@@ -526,8 +545,24 @@ func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
 		return
 	}
 	c.remoteTo = m.Get("to")
+	if m.Code >= 300 && c.delayed && (m.Code == 400 || m.Code == 415 || m.Code == 488 || m.Code == 606) {
+		// The engine wants an offer after all: ring again with ours.
+		g.ack(c, m, c.invite.All("via")[0], nil)
+		g.mu.Lock()
+		ended := c.state == sipEnded
+		g.mu.Unlock()
+		if !ended {
+			g.log.Info("phone refused the INVITE without SDP, offering", "call_id", c.waID, "code", m.Code)
+			c.delayed = false
+			c.cseq++
+			c.remoteTo = ""
+			if err := g.sendInvite(c); err == nil {
+				return
+			}
+		}
+	}
 	if m.Code >= 300 {
-		g.ack(c, m, c.invite.All("via")[0])
+		g.ack(c, m, c.invite.All("via")[0], nil)
 		g.mu.Lock()
 		ended := c.state == sipEnded
 		c.state = sipEnded
@@ -539,11 +574,22 @@ func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
 		}
 		return
 	}
-	// 200 OK
+	// 200 OK: the phone's answer to our offer, or (c.delayed) its offer,
+	// which we answer in the ACK.
 	if ct := sipAddrURI(m.Get("contact")); ct != "" {
 		c.target = ct
 	}
-	g.ack(c, m, "SIP/2.0/TCP "+c.mediaIP+";branch="+sipBranch())
+	ans, err := parseSDP(m.Body)
+	codec, ok := codecPCMU, false
+	if err == nil {
+		codec, ok = ans.pickCodec(g.cfg.Opus)
+		g.log.Info("phone sdp", "call_id", c.waID, "offer", c.delayed, "formats", ans.Formats, "rtpmap", ans.RTPMap, "codec", codec.String())
+	}
+	var ackSDP []byte
+	if c.delayed && ok {
+		ackSDP = buildSDP(c.mediaIP, c.pendingRTP.LocalPort(), c.sessionID, ans.Video, codec)
+	}
+	g.ack(c, m, "SIP/2.0/TCP "+c.mediaIP+";branch="+sipBranch(), ackSDP)
 	g.mu.Lock()
 	if c.state == sipEnded { // the caller hung up meanwhile
 		g.mu.Unlock()
@@ -553,12 +599,6 @@ func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
 	}
 	c.state = sipActive
 	g.mu.Unlock()
-	ans, err := parseSDP(m.Body)
-	codec, ok := codecPCMU, false
-	if err == nil {
-		codec, ok = ans.pickCodec(g.cfg.Opus)
-		g.log.Info("phone sdp answer", "call_id", c.waID, "formats", ans.Formats, "rtpmap", ans.RTPMap, "codec", codec.String())
-	}
 	if !ok {
 		g.log.Warn("phone answered without a codec we offered", "err", err)
 		g.sendBye(c)
@@ -577,7 +617,9 @@ func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
 	g.log.Info("phone answered", "call_id", c.waID)
 }
 
-func (g *sipGateway) ack(c *sipCall, resp *sipMsg, via string) {
+// ack acknowledges a final answer to our INVITE; sdp (delayed offer only)
+// is our answer to the offer in the phone's 200 OK.
+func (g *sipGateway) ack(c *sipCall, resp *sipMsg, via string, sdp []byte) {
 	uri := c.target
 	if resp.Code >= 300 {
 		uri = c.invite.URI
@@ -588,7 +630,12 @@ func (g *sipGateway) ack(c *sipCall, resp *sipMsg, via string) {
 	a.Add("From", c.invite.Get("from"))
 	a.Add("To", resp.Get("to"))
 	a.Add("Call-ID", c.sipID)
-	a.Add("CSeq", "1 ACK")
+	n, _ := c.invite.CSeq()
+	a.Add("CSeq", fmt.Sprintf("%d ACK", n))
+	if sdp != nil {
+		a.Add("Content-Type", "application/sdp")
+		a.Body = sdp
+	}
 	_ = c.phone.send(a)
 }
 
@@ -616,7 +663,8 @@ func (g *sipGateway) sendCancel(c *sipCall) {
 	x.Add("From", c.invite.Get("from"))
 	x.Add("To", c.invite.Get("to"))
 	x.Add("Call-ID", c.sipID)
-	x.Add("CSeq", "1 CANCEL")
+	n, _ := c.invite.CSeq()
+	x.Add("CSeq", fmt.Sprintf("%d CANCEL", n))
 	_ = c.phone.send(x)
 }
 
