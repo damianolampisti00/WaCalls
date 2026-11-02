@@ -261,7 +261,12 @@ func buildSDP(ip string, port int, sessID int64, rejectVideo bool, codecs ...sip
 		fmt.Sprintf("m=audio %d RTP/AVP %s", port, strings.Join(pts, " ")),
 	}
 	lines = append(lines, maps...)
-	lines = append(lines, "a=ptime:20", "a=sendrecv")
+	// RTCP on the RTP port: the engine starts its audio only once the
+	// connectivity check of both its components (RTP and RTCP) succeeds, and
+	// at port+1 nothing listens (the Berry Bridge relay has one port), so
+	// the RTCP one only timed out after ~5 s. There it reaches us and its
+	// probes are echoed (it knows no rtcp-mux, but reads a=rtcp).
+	lines = append(lines, fmt.Sprintf("a=rtcp:%d", port), "a=ptime:20", "a=sendrecv")
 	if rejectVideo {
 		lines = append(lines, "m=video 0 RTP/AVP 109")
 	}

@@ -518,7 +518,7 @@ func TestPickCodecPrefersTheEnginesOpusWB(t *testing.T) {
 
 func TestBuildSDPOffersOpusThenPCMU(t *testing.T) {
 	b := buildSDP("127.0.0.1", 40000, 7, false, codecOpusWB, codecPCMU)
-	for _, want := range []string{"m=audio 40000 RTP/AVP 126 0\r\n", "a=rtpmap:126 OPUS/16000\r\n", "a=rtpmap:0 PCMU/8000\r\n"} {
+	for _, want := range []string{"m=audio 40000 RTP/AVP 126 0\r\n", "a=rtpmap:126 OPUS/16000\r\n", "a=rtpmap:0 PCMU/8000\r\n", "a=rtcp:40000\r\n"} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("missing %q in\n%s", want, b)
 		}
