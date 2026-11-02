@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -241,16 +242,20 @@ func (p *fakePhone) sdp() string {
 		"m=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\nm=video %d RTP/AVP 109\r\na=rtpmap:109 H264/90000\r\n", port, port+2)
 }
 
-// readRTP waits for one of the gateway's audio packets.
+// readRTP waits for one of the gateway's audio packets (probes skipped).
 func (p *fakePhone) readRTP() ([]byte, *net.UDPAddr) {
 	p.t.Helper()
-	buf := make([]byte, 1500)
-	_ = p.rtp.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, from, err := p.rtp.ReadFromUDP(buf)
-	if err != nil {
-		p.t.Fatalf("no RTP from the gateway: %v", err)
+	for {
+		buf := make([]byte, 1500)
+		_ = p.rtp.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, from, err := p.rtp.ReadFromUDP(buf)
+		if err != nil {
+			p.t.Fatalf("no RTP from the gateway: %v", err)
+		}
+		if !isProbe(buf[:n]) {
+			return buf[:n], from
+		}
 	}
-	return buf[:n], from
 }
 
 func startSIPTest(t *testing.T, opts ...func(*sipConfig)) (*sipGateway, *fakeBackend, *Broker, *fakePhone) {
@@ -551,10 +556,12 @@ func TestSIPRTPOpusRoundTrip(t *testing.T) {
 	var first []byte
 	for n := 0; n < 6; n++ {
 		var p []byte
-		select {
-		case p = <-sent:
-		case <-time.After(2 * time.Second):
-			t.Fatal("no RTP sent")
+		for p == nil || isProbe(p) {
+			select {
+			case p = <-sent:
+			case <-time.After(2 * time.Second):
+				t.Fatal("no RTP sent")
+			}
 		}
 		if pt := int(p[1] & 0x7f); pt != 126 {
 			t.Fatalf("payload type %d", pt)
@@ -663,4 +670,37 @@ func TestSIPGatewayDelayedOfferRefusedRingsAgainWithOffer(t *testing.T) {
 	if rejected != 0 {
 		t.Fatal("the WhatsApp call was rejected on the 488")
 	}
+}
+
+func TestSIPRTPSendsAndEchoesTheEnginesProbes(t *testing.T) {
+	sent := make(chan []byte, 256)
+	tr := newTunnelRTP(func(_ int, p []byte) bool {
+		sent <- append([]byte(nil), p...)
+		return true
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := newSIPRTP(tr, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45536}, codecOpusWB, nil, log)
+	r.start()
+	defer r.close()
+	next := func() []byte {
+		select {
+		case p := <-sent:
+			return p
+		case <-time.After(2 * time.Second):
+			t.Fatal("nothing sent")
+		}
+		return nil
+	}
+	if p := next(); !isProbe(p) { // the very first packet: our probe
+		t.Fatalf("first packet % x is not a probe", p)
+	}
+	// The engine's own probe, as captured on 2026-11-02, comes back as is.
+	eng, _ := hex.DecodeString("807f03e8000003e80613e1c6" + hex.EncodeToString([]byte(probePayload)))
+	tr.deliver(45536, eng)
+	for i := 0; i < 50; i++ {
+		if p := next(); string(p) == string(eng) {
+			return
+		}
+	}
+	t.Fatal("the engine's probe was not echoed")
 }

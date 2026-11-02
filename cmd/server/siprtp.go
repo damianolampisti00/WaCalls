@@ -405,12 +405,19 @@ func (r *sipRTP) sender() {
 	frame := make([]float32, r.frame)
 	pcm := make([]int16, r.frame)
 	tsStep := uint32(r.codec.Clock / 50)
+	start, tick := time.Now(), 0
 	for {
 		select {
 		case <-r.stop:
 			return
 		case <-t.C:
 		}
+		if tick%probeEvery == 0 && time.Since(start) < probeFor {
+			if dst := r.remote.Load(); dst != nil {
+				_, _ = r.conn.WriteTo(probePacket(uint32(time.Since(start).Milliseconds())), dst)
+			}
+		}
+		tick++
 		r.mu.Lock()
 		if !r.started && len(r.down) >= rtpPrebufferFrames*r.frame {
 			r.started = true
@@ -479,6 +486,9 @@ func (r *sipRTP) receiver() {
 			}
 			continue
 		}
+		if isProbe(buf[:n]) {
+			_, _ = r.conn.WriteTo(append([]byte(nil), buf[:n]...), from) // echo: the check's answer
+		}
 		payload, pt, ok := rtpPayload(buf[:n])
 		if !ok || pt != r.codec.PT {
 			// e.g. the engine's firewall probes (PT 127) or RTCP. The first
@@ -528,6 +538,33 @@ func (r *sipRTP) receiver() {
 			r.onUp(pcm16)
 		}
 	}
+}
+
+// The engine's connectivity probe (Eyeball AnyFirewall), seen 2026-11-02:
+// RTP version 2, payload type 127, seq 1000, timestamp 1000, then a field
+// counting milliseconds where the SSRC would be, and "12345678901234567890".
+// Two engines send these to each other and start their audio once one
+// arrives; from us none came, so the phone stayed on "connecting" for ~5 s
+// after the answer (its check timing out) while the caller already talked.
+// So we send our own at the start and echo the phone's.
+const (
+	probePT      = 127
+	probeEvery   = 5 // sender ticks (100 ms)
+	probeFor     = 3 * time.Second
+	probePayload = "12345678901234567890"
+)
+
+func isProbe(p []byte) bool {
+	return len(p) == 12+len(probePayload) && p[0] == 0x80 && p[1]&0x7f == probePT && string(p[12:]) == probePayload
+}
+
+func probePacket(ms uint32) []byte {
+	p := make([]byte, 12, 12+len(probePayload))
+	p[0], p[1] = 0x80, probePT
+	binary.BigEndian.PutUint16(p[2:], 1000)
+	binary.BigEndian.PutUint32(p[4:], 1000)
+	binary.BigEndian.PutUint32(p[8:], ms)
+	return append(p, probePayload...)
 }
 
 // rtpPayload strips the RTP header (CSRCs, extension, padding).

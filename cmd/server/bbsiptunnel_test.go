@@ -137,12 +137,20 @@ func TestSIPOverTheBerryBridgeLink(t *testing.T) {
 	}
 	waitFor(t, "accept", func() bool { defer be.lock()(); return len(be.accepted) == 1 })
 
-	// downlink RTP reaches the engine's port
-	for len(p.rtp) == 0 {
+	// downlink RTP reaches the engine's port (after our connectivity probes)
+	audio := func() int {
+		for i, pk := range p.rtp {
+			if !isProbe(pk.data) {
+				return i
+			}
+		}
+		return -1
+	}
+	for audio() < 0 {
 		p.read()
 	}
-	if p.rtp[0].port != 45536 || len(p.rtp[0].data) != 12+160 {
-		t.Fatalf("RTP to the phone: port %d len %d", p.rtp[0].port, len(p.rtp[0].data))
+	if a := p.rtp[audio()]; a.port != 45536 || len(a.data) != 12+160 || p.rtp[0].port != 45536 {
+		t.Fatalf("RTP to the phone: port %d len %d", a.port, len(a.data))
 	}
 	// uplink RTP reaches the call core
 	for i := 0; i < 15; i++ {
