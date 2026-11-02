@@ -140,7 +140,7 @@ func TestSIPOverTheBerryBridgeLink(t *testing.T) {
 	// downlink RTP reaches the engine's port (after our connectivity probes)
 	audio := func() int {
 		for i, pk := range p.rtp {
-			if !isProbe(pk.data) {
+			if !isProbe(pk.data) && !isSTUN(pk.data) {
 				return i
 			}
 		}

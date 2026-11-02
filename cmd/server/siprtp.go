@@ -139,6 +139,10 @@ type sdpAudio struct {
 	Formats []int          // payload types of m=audio, in order
 	RTPMap  map[int]string // "PCMU/8000"
 	Video   bool           // the offer also had a video stream
+	// ICE bits of the phone's SDP (its connectivity checks, sipstun.go)
+	Ufrag, Pwd string
+	RTCPPort   int // a=rtcp; 0: RTP port + 1
+	Raw        string
 }
 
 func parseSDP(body []byte) (*sdpAudio, error) {
@@ -166,6 +170,12 @@ func parseSDP(body []byte) (*sdpAudio, error) {
 					}
 				}
 			}
+		case strings.HasPrefix(l, "a=ice-ufrag:") && (media == "" || media == "audio"):
+			s.Ufrag = strings.TrimSpace(l[len("a=ice-ufrag:"):])
+		case strings.HasPrefix(l, "a=ice-pwd:") && (media == "" || media == "audio"):
+			s.Pwd = strings.TrimSpace(l[len("a=ice-pwd:"):])
+		case strings.HasPrefix(l, "a=rtcp:") && media == "audio":
+			s.RTCPPort, _ = strconv.Atoi(strings.Fields(l[len("a=rtcp:"):] + " ")[0])
 		case strings.HasPrefix(l, "a=rtpmap:") && media == "audio":
 			pt, enc, ok := strings.Cut(l[len("a=rtpmap:"):], " ")
 			if n, err := strconv.Atoi(pt); ok && err == nil {
@@ -176,6 +186,7 @@ func parseSDP(body []byte) (*sdpAudio, error) {
 	if s.IP == "" || s.Port == 0 {
 		return nil, errors.New("sdp: no audio stream")
 	}
+	s.Raw = strings.ReplaceAll(strings.TrimSpace(string(body)), "\r\n", " | ")
 	return s, nil
 }
 
@@ -307,9 +318,12 @@ type sipRTP struct {
 	ssrc   uint32
 
 	codec sipCodec
-	frame int // samples per 20 ms packet in down: 160 (PCMU, 8 kHz) or 320 (Opus, 16 kHz)
-	enc   *bbOpusEncoder
-	dec   *bbOpusDecoder
+	// the phone's ICE credentials and RTCP port, for our connectivity checks
+	iceUfrag, icePwd string
+	rtcpPort         int
+	frame            int // samples per 20 ms packet in down: 160 (PCMU, 8 kHz) or 320 (Opus, 16 kHz)
+	enc              *bbOpusEncoder
+	dec              *bbOpusDecoder
 
 	mu      sync.Mutex
 	down    []float32 // audio waiting to be sent, at the codec's rate
@@ -420,6 +434,13 @@ func (r *sipRTP) sender() {
 		if tick%probeEvery == 0 && time.Since(start) < probeFor {
 			if dst := r.remote.Load(); dst != nil {
 				_, _ = r.conn.WriteTo(probePacket(uint32(time.Since(start).Milliseconds())), dst)
+				// ICE checks on both components (sipstun.go)
+				_, _ = r.conn.WriteTo(stunBindingRequestFor(r.iceUfrag, r.icePwd), dst)
+				rtcp := r.rtcpPort
+				if rtcp == 0 {
+					rtcp = dst.Port + 1
+				}
+				_, _ = r.conn.WriteTo(stunBindingRequestFor(r.iceUfrag, r.icePwd), &net.UDPAddr{IP: dst.IP, Port: rtcp})
 			}
 		}
 		tick++
@@ -477,7 +498,7 @@ func (r *sipRTP) receiver() {
 	buf := make([]byte, 2048)
 	var latched bool
 	start := time.Now()
-	others := 0
+	others, stuns := 0, 0
 	for {
 		n, from, err := r.conn.ReadFrom(buf)
 		if err != nil {
@@ -488,6 +509,18 @@ func (r *sipRTP) receiver() {
 			}
 			if errors.Is(err, net.ErrClosed) {
 				return
+			}
+			continue
+		}
+		if isSTUN(buf[:n]) {
+			typ := stunType(buf[:n])
+			if typ == stunBindingRequest {
+				_, _ = r.conn.WriteTo(stunBindingResponse(buf[:n], from), from)
+			}
+			if stuns < 8 {
+				stuns++
+				r.log.Info("sip stun from the phone", "after_ms", time.Since(start).Milliseconds(),
+					"type", fmt.Sprintf("%#04x", typ), "from", from, "len", n)
 			}
 			continue
 		}

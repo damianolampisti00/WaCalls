@@ -583,7 +583,7 @@ func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
 	codec, ok := codecPCMU, false
 	if err == nil {
 		codec, ok = ans.pickCodec(g.cfg.Opus)
-		g.log.Info("phone sdp", "call_id", c.waID, "offer", c.delayed, "formats", ans.Formats, "rtpmap", ans.RTPMap, "codec", codec.String())
+		g.log.Info("phone sdp", "call_id", c.waID, "offer", c.delayed, "formats", ans.Formats, "rtpmap", ans.RTPMap, "codec", codec.String(), "sdp", ans.Raw)
 	}
 	var ackSDP []byte
 	if c.delayed && ok {
@@ -738,7 +738,7 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 	codec, ok := codecPCMU, false
 	if err == nil {
 		codec, ok = offer.pickCodec(g.cfg.Opus)
-		g.log.Info("phone sdp offer", "formats", offer.Formats, "rtpmap", offer.RTPMap, "codec", codec.String())
+		g.log.Info("phone sdp offer", "formats", offer.Formats, "rtpmap", offer.RTPMap, "codec", codec.String(), "sdp", offer.Raw)
 	}
 	if !ok {
 		_ = p.send(sipResponse(m, 488, "Not Acceptable Here", sipRandom(4)))
@@ -839,6 +839,7 @@ func (g *sipGateway) startMedia(c *sipCall, remote *sdpAudio) {
 	waID := c.waID
 	pacer := newBBUpPacer(func(pcm []float32) { g.be.Feed(waID, pcm) })
 	rtp := newSIPRTP(c.pendingRTP, dst, c.codec, pacer.push, g.log.With("call_id", waID))
+	rtp.iceUfrag, rtp.icePwd, rtp.rtcpPort = remote.Ufrag, remote.Pwd, remote.RTCPPort
 	g.mu.Lock()
 	c.rtp, c.pacer, c.pendingRTP = rtp, pacer, nil
 	g.mu.Unlock()

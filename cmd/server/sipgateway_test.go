@@ -252,7 +252,7 @@ func (p *fakePhone) readRTP() ([]byte, *net.UDPAddr) {
 		if err != nil {
 			p.t.Fatalf("no RTP from the gateway: %v", err)
 		}
-		if !isProbe(buf[:n]) {
+		if !isProbe(buf[:n]) && !isSTUN(buf[:n]) {
 			return buf[:n], from
 		}
 	}
@@ -556,7 +556,7 @@ func TestSIPRTPOpusRoundTrip(t *testing.T) {
 	var first []byte
 	for n := 0; n < 6; n++ {
 		var p []byte
-		for p == nil || isProbe(p) {
+		for p == nil || isProbe(p) || isSTUN(p) {
 			select {
 			case p = <-sent:
 			case <-time.After(2 * time.Second):
@@ -691,7 +691,7 @@ func TestSIPRTPSendsAndEchoesTheEnginesProbes(t *testing.T) {
 		}
 		return nil
 	}
-	if p := next(); !isProbe(p) { // the very first packet: our probe
+	if p := next(); !isProbe(p) { // the very first packet: our probe (then our ICE checks)
 		t.Fatalf("first packet % x is not a probe", p)
 	}
 	// The engine's own probe, as captured on 2026-11-02, comes back as is.
