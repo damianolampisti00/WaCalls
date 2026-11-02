@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -456,5 +459,28 @@ func TestSIPGatewayRefusesOutsiders(t *testing.T) {
 	if gw.allowed(&net.TCPAddr{IP: net.IPv4(8, 8, 8, 8)}) || !gw.allowed(&net.TCPAddr{IP: net.IPv4(10, 1, 2, 3)}) ||
 		!gw.allowed(&net.TCPAddr{IP: net.IPv4(192, 168, 1, 72)}) {
 		t.Fatal("allow list")
+	}
+}
+
+func TestTunnelRegistrationSurvivesRestart(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "sip_tunnel.json")
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := newSIPGateway(nil, nil, sipConfig{StateFile: f}, log)
+	g.saveTunnelState("sip:wacalls@127.0.0.1:5000;transport=tcp", "<sip:wacalls@wacalls.local>", time.Now().Add(-time.Minute))
+
+	g2 := newSIPGateway(nil, nil, sipConfig{StateFile: f}, log)
+	if g2.tunnelContact != "sip:wacalls@127.0.0.1:5000;transport=tcp" || g2.tunnelAOR != "<sip:wacalls@wacalls.local>" {
+		t.Fatalf("restored %q %q", g2.tunnelContact, g2.tunnelAOR)
+	}
+
+	// Older than the lifetime we grant: the engine has re-registered or is gone.
+	g.saveTunnelState("sip:old@127.0.0.1:1", "<sip:old@x>", time.Now().Add(-(sipTunnelExpires+1)*time.Second))
+	if g3 := newSIPGateway(nil, nil, sipConfig{StateFile: f}, log); g3.tunnelContact != "" {
+		t.Fatalf("expired registration restored: %q", g3.tunnelContact)
+	}
+
+	g.saveTunnelState("", "", time.Time{})
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Fatalf("state file not removed: %v", err)
 	}
 }

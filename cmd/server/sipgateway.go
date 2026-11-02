@@ -30,6 +30,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +66,18 @@ type sipConfig struct {
 	RTPLo   int    // RTP port range
 	RTPHi   int
 	Allow   []*net.IPNet // who may connect
+	// StateFile keeps the registration made over the Berry Bridge link
+	// across restarts (empty: memory only). After a restart the engine
+	// still holds its connection to the relay and won't register again for
+	// up to sipTunnelExpires, so without it incoming calls miss the phone.
+	StateFile string
+}
+
+// sipTunnelState is StateFile's content.
+type sipTunnelState struct {
+	Contact string    `json:"contact"`
+	AOR     string    `json:"aor"`
+	At      time.Time `json:"at"` // of the REGISTER
 }
 
 type sipGateway struct {
@@ -134,8 +147,52 @@ func newSIPGateway(be sipBackend, broker *Broker, cfg sipConfig, log *slog.Logge
 	if cfg.RTPLo == 0 {
 		cfg.RTPLo, cfg.RTPHi = 40000, 40099
 	}
-	return &sipGateway{be: be, broker: broker, cfg: cfg, log: log.With("component", "sipgateway"),
+	g := &sipGateway{be: be, broker: broker, cfg: cfg, log: log.With("component", "sipgateway"),
 		calls: map[string]*sipCall{}, dialog: map[string]*sipCall{}}
+	g.loadTunnelState(time.Now())
+	return g
+}
+
+// loadTunnelState restores the last registration over the link if it is
+// still within its lifetime.
+func (g *sipGateway) loadTunnelState(now time.Time) {
+	if g.cfg.StateFile == "" {
+		return
+	}
+	b, err := os.ReadFile(g.cfg.StateFile)
+	if err != nil {
+		return
+	}
+	var st sipTunnelState
+	if json.Unmarshal(b, &st) != nil || st.Contact == "" {
+		return
+	}
+	if age := now.Sub(st.At); age < 0 || age > sipTunnelExpires*time.Second {
+		return
+	}
+	g.tunnelContact, g.tunnelAOR = st.Contact, st.AOR
+	g.log.Info("tunnel registration restored", "contact", st.Contact, "age", now.Sub(st.At).Round(time.Second))
+}
+
+// saveTunnelState writes (contact != "") or removes the state file.
+func (g *sipGateway) saveTunnelState(contact, aor string, at time.Time) {
+	f := g.cfg.StateFile
+	if f == "" {
+		return
+	}
+	if contact == "" {
+		_ = os.Remove(f)
+		return
+	}
+	b, _ := json.Marshal(sipTunnelState{Contact: contact, AOR: aor, At: at})
+	tmp := f + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		g.log.Warn("tunnel registration not saved", "err", err)
+		return
+	}
+	if err := os.Rename(tmp, f); err != nil {
+		g.log.Warn("tunnel registration not saved", "err", err)
+	}
 }
 
 // registered reports whether a phone is registered now (bbGateway then leaves
@@ -319,6 +376,10 @@ func (g *sipGateway) onRegister(p *sipPhone, m *sipMsg) {
 		if g.phone == p {
 			g.phone = nil
 		}
+		if p.newMedia != nil {
+			g.tunnelContact, g.tunnelAOR = "", ""
+			g.saveTunnelState("", "", time.Time{})
+		}
 		g.log.Info("phone unregistered")
 		return
 	}
@@ -326,6 +387,7 @@ func (g *sipGateway) onRegister(p *sipPhone, m *sipMsg) {
 	p.aor = m.Get("to")
 	if p.newMedia != nil {
 		g.tunnelContact, g.tunnelAOR = p.contact, p.aor
+		g.saveTunnelState(p.contact, p.aor, time.Now())
 	}
 	if g.phone != p {
 		g.log.Info("phone registered", "contact", p.contact, "from", p.conn.RemoteAddr(), "agent", m.Get("user-agent"))

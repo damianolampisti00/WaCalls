@@ -85,7 +85,8 @@ func main() {
 		}
 		be := &sessionBackend{sessions: srv.sessions, broker: srv.broker, sessionID: *bbSession}
 		sipGW = newSIPGateway(be, srv.broker, sipConfig{Domain: *sipDomain, MediaIP: *sipMediaIP,
-			RTPLo: lo, RTPHi: hi, Allow: allow}, log)
+			RTPLo: lo, RTPHi: hi, Allow: allow,
+			StateFile: filepath.Join(filepath.Dir(*dbPath), "sip_tunnel.json")}, log)
 		go func() {
 			log.Info("SIP gateway listening", "addr", *sipAddr)
 			if err := sipGW.serve(ctx, ln); err != nil {
