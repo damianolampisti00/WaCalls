@@ -95,7 +95,7 @@ func rtpExt(p []byte) (profile uint16, ids map[int]int) {
 		ext = ext[:4*words]
 	}
 	ids = map[int]int{}
-	if profile == 0xbede {
+	if profile == 0xbede || profile == 0xdebe { // WhatsApp writes the one-byte form as 0xDEBE
 		for i := 0; i < len(ext); {
 			if ext[i] == 0 {
 				i++
@@ -296,6 +296,16 @@ func main() {
 		for _, h := range firstHeads {
 			fmt.Fprintf(w, "    %s\n", h)
 		}
+		if len(aus) > 0 {
+			describeAU(w, aus[0].Data)
+		}
+		all := filepath.Join(dir, fmt.Sprintf("video-%d-all.h264", s.ssrc))
+		fa, _ := os.Create(all)
+		for _, a := range aus {
+			_, _ = fa.Write(a.Data)
+		}
+		fa.Close()
+		fmt.Fprintf(w, "  all frames (no IDR wait) %s\n", all)
 		out := filepath.Join(dir, fmt.Sprintf("video-%d.h264", s.ssrc))
 		f, _ := os.Create(out)
 		started := false
@@ -375,4 +385,42 @@ func nalScore(pays [][]byte) float64 {
 		}
 	}
 	return float64(ok) / float64(len(pays))
+}
+
+// describeAU lays out one access unit: its NAL units, and inside a NAL unit
+// bigger than an SPS/PPS should be, any AVCC-style (4-byte length) list.
+func describeAU(w io.Writer, au []byte) {
+	fmt.Fprintf(w, "  first frame %d B: % x ...\n", len(au), au[:min(len(au), 48)])
+	nals := bytes.Split(au, []byte{0, 0, 0, 1})
+	for _, n := range nals {
+		if len(n) == 0 {
+			continue
+		}
+		fmt.Fprintf(w, "    NAL type %d, %d B\n", n[0]&0x1f, len(n))
+		if t := n[0] & 0x1f; (t == 7 || t == 8) && len(n) > 64 {
+			// try a length-prefixed list after the first bytes
+			for start := 1; start < 64 && start+4 < len(n); start++ {
+				var parts []string
+				off := start
+				for off+4 <= len(n) {
+					l := int(binary.BigEndian.Uint32(n[off:]))
+					if l <= 0 || off+4+l > len(n) {
+						break
+					}
+					parts = append(parts, fmt.Sprintf("type %d %dB", n[off+4]&0x1f, l))
+					off += 4 + l
+				}
+				if off == len(n) && len(parts) > 0 {
+					fmt.Fprintf(w, "      AVCC list from byte %d: %v\n", start, parts)
+				}
+			}
+			for i := 1; i+1 < len(n); i++ { // other NAL headers that may hide inside
+				if n[i] == 0x65 || n[i] == 0x68 || n[i] == 0x25 || n[i] == 0x28 {
+					if i < 40 {
+						fmt.Fprintf(w, "      byte %d = %#02x\n", i, n[i])
+					}
+				}
+			}
+		}
+	}
 }

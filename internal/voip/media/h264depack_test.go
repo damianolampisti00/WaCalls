@@ -49,3 +49,18 @@ func TestH264DepackDropsAFrameWithAHole(t *testing.T) {
 		t.Fatal("frame without its FU-A start delivered")
 	}
 }
+
+// WhatsApp's keyframe (captured 2026-11-03): SPS, PPS and IDR with start
+// codes inside one FU-A whose header names the SPS.
+func TestH264DepackWhatsAppKeyframeInOneFU(t *testing.T) {
+	var d H264Depacketizer
+	blob := []byte{0x4d, 0x4c, 0x0c, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80, 0, 0, 0, 1, 0x65, 0xb8, 0, 4}
+	d.Push(1, 100, false, append([]byte{0x7c, 0x87}, blob[:6]...))
+	out := d.Push(2, 100, true, append([]byte{0x1c, 0x47}, blob[6:]...))
+	if len(out) != 1 || !out[0].IDR {
+		t.Fatalf("keyframe not recognised: %+v", out)
+	}
+	if !bytes.HasPrefix(out[0].Data, []byte{0, 0, 0, 1, 0x67, 0x4d, 0x4c, 0x0c, 0, 0, 0, 1, 0x68}) {
+		t.Fatalf("frame % x", out[0].Data)
+	}
+}

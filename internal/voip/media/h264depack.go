@@ -28,7 +28,7 @@ type AccessUnit struct {
 
 func (d *H264Depacketizer) flush(out []AccessUnit) []AccessUnit {
 	if d.open && !d.broken && len(d.au) > 0 {
-		out = append(out, AccessUnit{Data: d.au, TS: d.ts, IDR: d.idr})
+		out = append(out, AccessUnit{Data: d.au, TS: d.ts, IDR: d.idr || hasIDR(d.au)})
 	}
 	d.au, d.open, d.broken, d.inFU, d.idr = nil, false, false, false, false
 	return out
@@ -104,4 +104,23 @@ func (d *H264Depacketizer) Push(seq uint16, ts uint32, marker bool, p []byte) []
 		out = d.flush(out)
 	}
 	return out
+}
+
+// hasIDR: an IDR slice anywhere in the frame. WhatsApp sends its keyframe
+// as one FU-A whose payload is SPS, PPS and the IDR with their Annex-B
+// start codes inside: the FU header only names the SPS (seen 2026-11-03).
+func hasIDR(au []byte) bool {
+	for i := 0; i+3 < len(au); i++ {
+		if au[i] == 0 && au[i+1] == 0 && (au[i+2] == 1 || au[i+2] == 0 && au[i+3] == 1) {
+			j := i + 3
+			if au[i+2] == 0 {
+				j++
+			}
+			if j < len(au) && au[j]&0x1f == 5 {
+				return true
+			}
+			i = j - 1
+		}
+	}
+	return false
 }
