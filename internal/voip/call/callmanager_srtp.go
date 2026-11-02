@@ -41,6 +41,9 @@ func (m *CallManager) initSrtpKeysLocked() {
 		return
 	}
 	m.srtpSession = sess
+	m.keyInfo = CallKeyInfo{CallID: call.CallID, EncryptionKey: call.EncryptionKey, OurDevice: ourDeviceJid,
+		PeerDevice: peerDeviceJid, Participants: participants, SendKey: sendKM.MasterKey, SendSalt: sendKM.MasterSalt,
+		RecvKey: recvKM.MasterKey, RecvSalt: recvKM.MasterSalt}
 	m.log.Debug("srtp per-jid keys set", "send", ourDeviceJid, "recv", peerDeviceJid)
 }
 
@@ -62,6 +65,8 @@ func (m *CallManager) reinitSrtpLocked(peerKey []byte, peerJid types.JID) {
 	}
 	if sess, err := media.NewSrtpSession(sendKM, recvKM, core.SRTPSendAuthTagLen, core.SRTPRecvAuthTagLen); err == nil {
 		m.srtpSession = sess
+		m.keyInfo.PeerCallKey, m.keyInfo.PeerDevice = peerKey, peerJid.String()
+		m.keyInfo.RecvKey, m.keyInfo.RecvSalt = recvKM.MasterKey, recvKM.MasterSalt
 		m.log.Debug("srtp re-initialized with peer call key")
 	}
 }

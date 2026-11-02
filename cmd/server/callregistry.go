@@ -17,6 +17,7 @@ type mediaBridge interface {
 type activeCall struct {
 	cm     *call.CallManager
 	bridge mediaBridge
+	cap    *callCapture // -wa-call-capture
 }
 
 type callRegistry struct {

@@ -49,10 +49,35 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 }
 
 func (s *Session) createCall(callID string) *call.CallManager {
-	cm := call.NewCallManager(wa.NewSocket(s.client), s.log)
+	var sock core.VoipSocket = wa.NewSocket(s.client)
+	var cap *callCapture
+	if captureDir != "" {
+		var err error
+		if cap, err = newCallCapture(callID); err != nil {
+			s.log.Warn("call capture", "err", err)
+			cap = nil
+		} else {
+			sock = captureSocket{VoipSocket: sock, cap: cap}
+		}
+	}
+	cm := call.NewCallManager(sock, s.log)
+	if cap != nil {
+		cap.cm = cm
+		cm.OnRawMedia = cap.media
+	}
 	s.wireCall(cm, callID)
-	s.reg.add(callID, &activeCall{cm: cm})
+	s.reg.add(callID, &activeCall{cm: cm, cap: cap})
 	return cm
+}
+
+// captureStanza records an incoming call stanza in its call's capture.
+func (s *Session) captureStanza(kind string, from types.JID, data *waBinary.Node) {
+	if captureDir == "" || data == nil {
+		return
+	}
+	if ac, ok := s.callForEvent(from, data); ok && ac.cap != nil {
+		ac.cap.event("in", kind, wrapCall(from, data).String())
+	}
 }
 
 func (s *Session) wireCall(cm *call.CallManager, callID string) {
@@ -104,6 +129,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 	}
 	cm.OnEnded = func(c *call.CallInfo) {
+		if ac, ok := s.reg.get(c.CallID); ok && ac.cap != nil {
+			s.log.Info("call captured", "dir", ac.cap.close())
+		}
 		dumpMu.Lock()
 		for _, d := range dumps {
 			if d != nil {
@@ -171,6 +199,7 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 		return
 	}
 	cm := s.createCall(callID)
+	s.captureStanza("offer", evt.From, evt.Data)
 	cm.HandleCallOffer(ctx, node, evt.From)
 }
 
@@ -204,30 +233,39 @@ func (s *Session) handleEvent(rawEvt any) {
 	case *events.CallOffer:
 		s.onIncomingOffer(ctx, evt)
 	case *events.CallAccept:
+		s.captureStanza("accept", evt.From, evt.Data)
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallAccept(ctx, wrapCall(evt.From, evt.Data), evt.From)
 		}
 	case *events.CallTransport:
+		s.captureStanza("transport", evt.From, evt.Data)
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallTransport(ctx, wrapCall(evt.From, evt.Data), evt.From)
 		}
 	case *events.CallTerminate:
+		s.captureStanza("terminate", evt.From, evt.Data)
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
 		}
 	case *events.CallReject:
+		s.captureStanza("reject", evt.From, evt.Data)
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
 		}
 	// Not acted on, logged: they tell whether the peer's devices got an offer.
 	case *events.CallPreAccept:
+		s.captureStanza("preaccept", evt.From, evt.Data)
 		s.log.Info("call preaccept", "call_id", evt.CallID, "from", evt.From.String())
 	case *events.CallRelayLatency:
+		s.captureStanza("relaylatency", evt.From, evt.Data)
 		s.log.Info("call relaylatency", "call_id", evt.CallID, "from", evt.From.String())
 	case *events.CallOfferNotice:
 		s.log.Info("call offer notice", "call_id", evt.CallID, "from", evt.From.String(), "media", evt.Media)
 	case *events.UnknownCallEvent:
 		if evt.Node != nil {
+			if ac, ok := s.reg.get(callIDFromNode(evt.Node)); ok && ac.cap != nil {
+				ac.cap.event("in", "unknown", evt.Node.String())
+			}
 			s.log.Info("unknown call event", "children", callChildTags(evt.Node))
 		}
 	case *events.Receipt:

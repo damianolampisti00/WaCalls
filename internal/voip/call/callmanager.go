@@ -26,6 +26,7 @@ type CallManager struct {
 	// the peer's video streams: one receive context per SSRC, for videoSess
 	videoSess *media.SrtpSession
 	videoRecv map[uint32]*media.SrtpContext
+	keyInfo   CallKeyInfo // what the SRTP keys were derived from (capture)
 	codec     media.Codec
 	relay     RelayTransport
 
@@ -53,6 +54,9 @@ type CallManager struct {
 	// OnPeerVideo: one decrypted RTP packet of the peer's video (H.264,
 	// payload type 97); called from the relay's receive path.
 	OnPeerVideo func(*media.RtpPacket)
+	// OnRawMedia (capture): every media packet from (out=false) or to the
+	// relay, as on the wire (SRTP); data must not be kept.
+	OnRawMedia func(out bool, data []byte)
 	// OnSentPCM gets each frame sent to the peer (captured audio or the
 	// keep-alive silence), in order: an echo canceller's reference.
 	OnSentPCM func([]float32)
@@ -249,3 +253,30 @@ func (m *CallManager) ownCredJid() string {
 type CallError struct{ Msg string }
 
 func (e *CallError) Error() string { return e.Msg }
+
+// CallKeyInfo: the inputs and outputs of the call's SRTP key derivation,
+// for an offline capture analysis (cmd/videodiag).
+type CallKeyInfo struct {
+	CallID        string   `json:"call_id"`
+	EncryptionKey []byte   `json:"encryption_key"`
+	PeerCallKey   []byte   `json:"peer_call_key,omitempty"` // after a re-init with the peer's key
+	OurDevice     string   `json:"our_device"`
+	PeerDevice    string   `json:"peer_device"`
+	Participants  []string `json:"participants"`
+	SendKey       []byte   `json:"send_key"`
+	SendSalt      []byte   `json:"send_salt"`
+	RecvKey       []byte   `json:"recv_key"`
+	RecvSalt      []byte   `json:"recv_salt"`
+	SelfSSRC      uint32   `json:"self_ssrc"`
+	PeerSSRCs     []uint32 `json:"peer_ssrcs"`
+}
+
+// KeyInfo returns the current CallKeyInfo.
+func (m *CallManager) KeyInfo() CallKeyInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := m.keyInfo
+	k.SelfSSRC = m.selfSsrc
+	k.PeerSSRCs = append([]uint32(nil), m.peerSsrcs...)
+	return k
+}

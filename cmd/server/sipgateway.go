@@ -113,6 +113,7 @@ type sipPhone struct {
 }
 
 func (p *sipPhone) send(m *sipMsg) error {
+	sipTrace(true, m)
 	p.wmu.Lock()
 	defer p.wmu.Unlock()
 	_ = p.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -331,6 +332,7 @@ func (g *sipGateway) readLoop(ctx context.Context, p *sipPhone) {
 					return
 				}
 				buf = buf[used:]
+				sipTrace(false, m)
 				g.handle(ctx, p, m)
 			}
 		}

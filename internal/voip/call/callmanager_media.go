@@ -76,6 +76,9 @@ func (m *CallManager) sendOpusFrameLocked(opus []byte) {
 		m.log.Debug("srtp protect error", "err", err)
 		return
 	}
+	if m.OnRawMedia != nil {
+		m.OnRawMedia(true, srtp)
+	}
 	m.relay.Broadcast(srtp)
 }
 
@@ -113,6 +116,9 @@ func (m *CallManager) startSilenceKeepaliveLocked() {
 }
 
 func (m *CallManager) onRelayData(data []byte) {
+	if m.OnRawMedia != nil {
+		m.OnRawMedia(false, data)
+	}
 	if transport.IsStunPacket(data) {
 		return
 	}
