@@ -82,6 +82,9 @@ type bbGateway struct {
 	log       *slog.Logger
 	tokenHash [32]byte
 	sessionID string // empty: the first paired session
+	// sipPhone, when set, says a phone is registered on the SIP gateway
+	// (sipgateway.go): incoming calls then ring there, not in this app.
+	sipPhone func() bool
 
 	mu     sync.Mutex
 	conn   *bbConn // the phone connected now (a new connection replaces it)
@@ -287,19 +290,22 @@ func (g *bbGateway) current() *bbConn {
 }
 
 // session picks the WhatsApp account the phone works with.
-func (g *bbGateway) session() (*Session, error) {
-	if g.sessions == nil {
+func (g *bbGateway) session() (*Session, error) { return pickSession(g.sessions, g.sessionID) }
+
+// pickSession returns the session with this id, or the first paired one.
+func pickSession(sessions *SessionManager, id string) (*Session, error) {
+	if sessions == nil {
 		return nil, errors.New("no session manager")
 	}
-	if g.sessionID != "" {
-		if s, ok := g.sessions.Get(g.sessionID); ok {
+	if id != "" {
+		if s, ok := sessions.Get(id); ok {
 			return s, nil
 		}
 		return nil, errors.New("session not found")
 	}
-	for _, info := range g.sessions.infos() {
+	for _, info := range sessions.infos() {
 		if info.Paired {
-			if s, ok := g.sessions.Get(info.ID); ok {
+			if s, ok := sessions.Get(info.ID); ok {
 				return s, nil
 			}
 		}
@@ -309,7 +315,10 @@ func (g *bbGateway) session() (*Session, error) {
 
 // phoneOf turns a peer JID into "+<number>" when it can: directly for a
 // phone-number JID, through whatsmeow's LID map for a LID (privacy) JID.
-func (g *bbGateway) phoneOf(sess *Session, jid string) string {
+func (g *bbGateway) phoneOf(sess *Session, jid string) string { return phoneOfJID(sess, jid) }
+
+// phoneOfJID turns a peer JID (phone number or LID) into "+<number>", or "".
+func phoneOfJID(sess *Session, jid string) string {
 	j, err := types.ParseJID(jid)
 	if err != nil {
 		return ""
@@ -360,6 +369,12 @@ func (g *bbGateway) forwardEvents(c *bbConn) {
 		}
 		id, _ := ev["id"].(string)
 		peer, _ := ev["peer"].(string)
+		if owner, _ := ev["owner"].(string); owner == sipOwner {
+			continue // the phone's native call engine has it
+		}
+		if ev["type"] == "incoming" && g.sipPhone != nil && g.sipPhone() {
+			continue
+		}
 		switch ev["type"] {
 		case "incoming":
 			c.sendJSON(map[string]any{"type": "call.incoming", "callId": id, "peer": peer, "phone": g.phoneOf(sess, peer)})

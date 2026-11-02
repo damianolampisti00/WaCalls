@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +25,11 @@ func main() {
 	bbAddr := flag.String("bb-addr", "", "Berry Bridge gateway listen address (empty = off), see bbgateway.go")
 	bbTokenFile := flag.String("bb-token-file", "", "file holding the Berry Bridge gateway token")
 	bbSession := flag.String("bb-session", "", "session the Berry Bridge phone uses (empty = first paired)")
+	sipAddr := flag.String("sip-addr", "", "SIP gateway TCP listen address for the phone's native call engine (empty = off), see sipgateway.go")
+	sipDomain := flag.String("sip-domain", "wacalls.local", "SIP domain")
+	sipMediaIP := flag.String("sip-media-ip", "", "IP for RTP (empty = the phone connection's local address)")
+	sipRTPPorts := flag.String("sip-rtp-ports", "40000-40099", "RTP port range")
+	sipAllow := flag.String("sip-allow", "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16", "networks allowed to connect to the SIP gateway")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -56,6 +63,34 @@ func main() {
 		}
 	}()
 
+	var sipGW *sipGateway
+	if *sipAddr != "" {
+		var lo, hi int
+		if _, err := fmt.Sscanf(*sipRTPPorts, "%d-%d", &lo, &hi); err != nil || lo <= 0 || hi < lo {
+			log.Error("bad -sip-rtp-ports", "value", *sipRTPPorts)
+			os.Exit(1)
+		}
+		allow, err := parseCIDRs(*sipAllow)
+		if err != nil {
+			log.Error("bad -sip-allow", "err", err)
+			os.Exit(1)
+		}
+		ln, err := net.Listen("tcp", *sipAddr)
+		if err != nil {
+			log.Error("SIP gateway listen failed", "err", err)
+			os.Exit(1)
+		}
+		be := &sessionBackend{sessions: srv.sessions, broker: srv.broker, sessionID: *bbSession}
+		sipGW = newSIPGateway(be, srv.broker, sipConfig{Domain: *sipDomain, MediaIP: *sipMediaIP,
+			RTPLo: lo, RTPHi: hi, Allow: allow}, log)
+		go func() {
+			log.Info("SIP gateway listening", "addr", *sipAddr)
+			if err := sipGW.serve(ctx, ln); err != nil {
+				log.Error("SIP gateway error", "err", err)
+			}
+		}()
+	}
+
 	var bbSrv *http.Server
 	if *bbAddr != "" {
 		token, err := os.ReadFile(*bbTokenFile)
@@ -65,6 +100,9 @@ func main() {
 		}
 		bbDumpFlag = filepath.Join(filepath.Dir(*bbTokenFile), "echo_dump_next")
 		gw := newBBGateway(srv.sessions, srv.broker, string(token), *bbSession, log)
+		if sipGW != nil {
+			gw.sipPhone = sipGW.registered
+		}
 		bbSrv = &http.Server{Addr: *bbAddr, Handler: gw.routes()}
 		go func() {
 			log.Info("Berry Bridge gateway listening", "addr", *bbAddr)
