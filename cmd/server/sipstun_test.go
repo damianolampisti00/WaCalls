@@ -115,3 +115,24 @@ func TestSIPRTPSendsICEChecksAndAnswersThePhones(t *testing.T) {
 		}
 	}
 }
+
+// The engine's offer of 2026-11-02 23:21 (with a working STUN server).
+func TestParseSDPHostCandidatesAndICECredentials(t *testing.T) {
+	sdp := "v=0\r\no=Eyeball 1 1 IN IP4 151.44.14.220\r\ns=Eyeball AnyFirewall Engine\r\nc=IN IP4 151.44.14.220\r\nt=0 0\r\n" +
+		"a=ice-pwd:GojpgnGna8JKv4cHfEta+77j/Eyeball\r\na=ice-ufrag:AFZZs1\r\nm=audio 13268 RTP/AVP 126 0 101\r\n" +
+		"a=candidate:1 1 UDP 2130706431 192.168.8.149 45536 typ host\r\n" +
+		"a=candidate:2 1 UDP 1694498815 151.44.14.220 13268 typ srflx raddr 192.168.8.149 rport 45536\r\n" +
+		"a=rtcp:13269\r\na=candidate:1 2 UDP 2130706430 192.168.8.149 45535 typ host\r\n" +
+		"a=candidate:2 2 UDP 1694498814 151.44.14.220 13269 typ srflx raddr 192.168.8.149 rport 45535\r\n" +
+		"a=rtpmap:126 OPUS/16000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
+	s, err := parseSDP([]byte(sdp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Port != 13268 || s.RTCPPort != 13269 || s.HostPort != 45536 || s.HostRTCPPort != 45535 {
+		t.Fatalf("ports m=%d rtcp=%d host=%d/%d", s.Port, s.RTCPPort, s.HostPort, s.HostRTCPPort)
+	}
+	if s.Ufrag != "AFZZs1" || s.Pwd != "GojpgnGna8JKv4cHfEta+77j/Eyeball" {
+		t.Fatalf("ice %q %q", s.Ufrag, s.Pwd)
+	}
+}

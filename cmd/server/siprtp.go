@@ -142,7 +142,11 @@ type sdpAudio struct {
 	// ICE bits of the phone's SDP (its connectivity checks, sipstun.go)
 	Ufrag, Pwd string
 	RTCPPort   int // a=rtcp; 0: RTP port + 1
-	Raw        string
+	// the phone's own ports (host candidates, components 1 and 2): with a
+	// STUN server the engine puts its public address in c=/m=, so through
+	// the Berry Bridge relay (same phone) only these reach it
+	HostPort, HostRTCPPort int
+	Raw                    string
 }
 
 func parseSDP(body []byte) (*sdpAudio, error) {
@@ -174,6 +178,19 @@ func parseSDP(body []byte) (*sdpAudio, error) {
 			s.Ufrag = strings.TrimSpace(l[len("a=ice-ufrag:"):])
 		case strings.HasPrefix(l, "a=ice-pwd:") && (media == "" || media == "audio"):
 			s.Pwd = strings.TrimSpace(l[len("a=ice-pwd:"):])
+		case strings.HasPrefix(l, "a=candidate:") && media == "audio":
+			// a=candidate:<foundation> <component> UDP <prio> <ip> <port> typ host
+			f := strings.Fields(l[len("a=candidate:"):])
+			if len(f) >= 8 && f[6] == "typ" && f[7] == "host" && strings.EqualFold(f[2], "udp") {
+				if port, err := strconv.Atoi(f[5]); err == nil {
+					switch {
+					case f[1] == "1" && s.HostPort == 0:
+						s.HostPort = port
+					case f[1] == "2" && s.HostRTCPPort == 0:
+						s.HostRTCPPort = port
+					}
+				}
+			}
 		case strings.HasPrefix(l, "a=rtcp:") && media == "audio":
 			s.RTCPPort, _ = strconv.Atoi(strings.Fields(l[len("a=rtcp:"):] + " ")[0])
 		case strings.HasPrefix(l, "a=rtpmap:") && media == "audio":

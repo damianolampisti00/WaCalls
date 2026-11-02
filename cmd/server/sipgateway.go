@@ -836,10 +836,16 @@ func (g *sipGateway) onPhoneHangup(ctx context.Context, sipID, why string) {
 
 func (g *sipGateway) startMedia(c *sipCall, remote *sdpAudio) {
 	dst := &net.UDPAddr{IP: net.ParseIP(remote.IP), Port: remote.Port}
+	rtcpPort := remote.RTCPPort
+	if c.phone.newMedia != nil && remote.HostPort > 0 {
+		// through the relay on the phone itself: its own ports, not the
+		// public ones it learned from STUN
+		dst.Port, rtcpPort = remote.HostPort, remote.HostRTCPPort
+	}
 	waID := c.waID
 	pacer := newBBUpPacer(func(pcm []float32) { g.be.Feed(waID, pcm) })
 	rtp := newSIPRTP(c.pendingRTP, dst, c.codec, pacer.push, g.log.With("call_id", waID))
-	rtp.iceUfrag, rtp.icePwd, rtp.rtcpPort = remote.Ufrag, remote.Pwd, remote.RTCPPort
+	rtp.iceUfrag, rtp.icePwd, rtp.rtcpPort = remote.Ufrag, remote.Pwd, rtcpPort
 	g.mu.Lock()
 	c.rtp, c.pacer, c.pendingRTP = rtp, pacer, nil
 	g.mu.Unlock()
