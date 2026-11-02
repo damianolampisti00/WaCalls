@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"wacalls/internal/voip/media"
 )
 
 // ---- unit tests ------------------------------------------------------------
@@ -316,7 +317,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func TestSIPGatewayIncomingCallAnsweredAndHungUpByPhone(t *testing.T) {
 	_, be, broker, p := startSIPTest(t)
 	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wa1", Direction: "inbound", Status: StatusRinging})
-	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net")
+	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net", false)
 
 	inv := p.read()
 	if inv.Method != "INVITE" || !strings.Contains(inv.Get("from"), "\"+393331234567\" <sip:393331234567@") {
@@ -391,7 +392,7 @@ func TestSIPGatewayIncomingCallAnsweredAndHungUpByPhone(t *testing.T) {
 func TestSIPGatewayCallerGivesUpWhileRinging(t *testing.T) {
 	_, be, broker, p := startSIPTest(t)
 	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wa2", Direction: "inbound", Status: StatusRinging})
-	broker.emitIncoming("s1", "wa2", "393330000000@s.whatsapp.net")
+	broker.emitIncoming("s1", "wa2", "393330000000@s.whatsapp.net", false)
 	inv := p.read()
 	broker.endCall("wa2", "timeout")
 	cancel := p.read()
@@ -414,7 +415,7 @@ func TestSIPGatewayCallerGivesUpWhileRinging(t *testing.T) {
 func TestSIPGatewayPhoneDeclines(t *testing.T) {
 	_, be, broker, p := startSIPTest(t)
 	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wa3", Direction: "inbound", Status: StatusRinging})
-	broker.emitIncoming("s1", "wa3", "39333@s.whatsapp.net")
+	broker.emitIncoming("s1", "wa3", "39333@s.whatsapp.net", false)
 	inv := p.read()
 	p.sendMsg(sipResponse(inv, 486, "Busy Here", "ph3"))
 	if ack := p.read(); ack.Method != "ACK" {
@@ -606,7 +607,7 @@ func (p *fakePhone) engineOffer() string {
 func TestSIPGatewayDelayedOfferGetsOpus(t *testing.T) {
 	_, be, broker, p := startSIPTest(t, opusDelayed)
 	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wa1", Direction: "inbound", Status: StatusRinging})
-	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net")
+	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net", false)
 
 	inv := p.read()
 	if inv.Method != "INVITE" || len(inv.Body) != 0 || inv.Get("content-type") != "" {
@@ -640,7 +641,7 @@ func TestSIPGatewayDelayedOfferGetsOpus(t *testing.T) {
 func TestSIPGatewayDelayedOfferRefusedRingsAgainWithOffer(t *testing.T) {
 	_, be, broker, p := startSIPTest(t, opusDelayed)
 	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wa1", Direction: "inbound", Status: StatusRinging})
-	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net")
+	broker.emitIncoming("s1", "wa1", "393331234567@s.whatsapp.net", false)
 
 	inv := p.read()
 	p.sendMsg(sipResponse(inv, 488, "Not Acceptable Here", "ph1"))
@@ -703,4 +704,32 @@ func TestSIPRTPSendsAndEchoesTheEnginesProbes(t *testing.T) {
 		}
 	}
 	t.Fatal("the engine's probe was not echoed")
+}
+
+// A WhatsApp video call rings the phone with an offer that has video
+// (the engine decides on video from the offer: no delayed offer).
+func TestSIPGatewayVideoCallOffersVideo(t *testing.T) {
+	_, be, broker, p := startSIPTest(t, opusDelayed)
+	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "wav", Direction: "inbound", Status: StatusRinging})
+	broker.emitIncoming("s1", "wav", "393331234567@s.whatsapp.net", true)
+	inv := p.read()
+	offer, err := parseSDP(inv.Body)
+	if err != nil || !offer.Video || offer.VideoPT != sipVideoPT || offer.Formats[0] != 126 {
+		t.Fatalf("video offer %+v %v\n%s", offer, err, inv.Body)
+	}
+	ok := sipResponse(inv, 200, "OK", "ph1")
+	ok.Add("Contact", "<sip:wacalls@127.0.0.1:18724;transport=tcp>")
+	ok.Add("Content-Type", "application/sdp")
+	ok.Body = []byte(p.sdp()) // PCMU and m=video 109, as the engine answered on 2026-11-02
+	p.sendMsg(ok)
+	if ack := p.read(); ack.Method != "ACK" || len(ack.Body) != 0 {
+		t.Fatalf("ACK: %s", ack.Bytes())
+	}
+	waitFor(t, "accept", func() bool { defer be.lock()(); return len(be.accepted) == 1 && be.attached["wav"] != nil })
+	be.mu.Lock()
+	br := be.attached["wav"]
+	be.mu.Unlock()
+	if _, ok := br.(interface{ WriteVideo(media.AccessUnit) }); !ok {
+		t.Fatal("the bridge takes no video")
+	}
 }

@@ -121,7 +121,7 @@ func TestSIPOverTheBerryBridgeLink(t *testing.T) {
 	waitFor(t, "registration", sipGW.registered)
 
 	broker.upsertCall(CallRecord{SessionID: "s1", CallID: "waT", Direction: "inbound", Status: StatusRinging})
-	broker.emitIncoming("s1", "waT", "393331234567@s.whatsapp.net")
+	broker.emitIncoming("s1", "waT", "393331234567@s.whatsapp.net", false)
 	inv := p.readSIP()
 	offer, err := parseSDP(inv.Body)
 	if inv.Method != "INVITE" || err != nil || offer.IP != "127.0.0.1" || offer.Port != bbTunnelRTPPort {

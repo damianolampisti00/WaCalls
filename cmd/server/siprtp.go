@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"wacalls/internal/voip/media"
 )
 
 // ---- G.711 mu-law ----------------------------------------------------------
@@ -146,7 +148,9 @@ type sdpAudio struct {
 	// STUN server the engine puts its public address in c=/m=, so through
 	// the Berry Bridge relay (same phone) only these reach it
 	HostPort, HostRTCPPort int
-	Raw                    string
+	// the video stream (m=video), when the phone has one
+	VideoPort, VideoPT, VideoRTCPPort, VideoHostPort, VideoHostRTCPPort int
+	Raw                                                                 string
 }
 
 func parseSDP(body []byte) (*sdpAudio, error) {
@@ -165,6 +169,10 @@ func parseSDP(body []byte) (*sdpAudio, error) {
 			media = f[0]
 			if media == "video" && len(f) > 1 && f[1] != "0" {
 				s.Video = true
+				s.VideoPort, _ = strconv.Atoi(f[1])
+				if len(f) >= 4 {
+					s.VideoPT, _ = strconv.Atoi(f[3])
+				}
 			}
 			if media == "audio" && len(f) >= 3 && s.Port == 0 {
 				s.Port, _ = strconv.Atoi(f[1])
@@ -178,21 +186,27 @@ func parseSDP(body []byte) (*sdpAudio, error) {
 			s.Ufrag = strings.TrimSpace(l[len("a=ice-ufrag:"):])
 		case strings.HasPrefix(l, "a=ice-pwd:") && (media == "" || media == "audio"):
 			s.Pwd = strings.TrimSpace(l[len("a=ice-pwd:"):])
-		case strings.HasPrefix(l, "a=candidate:") && media == "audio":
+		case strings.HasPrefix(l, "a=candidate:") && (media == "audio" || media == "video"):
 			// a=candidate:<foundation> <component> UDP <prio> <ip> <port> typ host
 			f := strings.Fields(l[len("a=candidate:"):])
 			if len(f) >= 8 && f[6] == "typ" && f[7] == "host" && strings.EqualFold(f[2], "udp") {
 				if port, err := strconv.Atoi(f[5]); err == nil {
+					rtp, rtcp := &s.HostPort, &s.HostRTCPPort
+					if media == "video" {
+						rtp, rtcp = &s.VideoHostPort, &s.VideoHostRTCPPort
+					}
 					switch {
-					case f[1] == "1" && s.HostPort == 0:
-						s.HostPort = port
-					case f[1] == "2" && s.HostRTCPPort == 0:
-						s.HostRTCPPort = port
+					case f[1] == "1" && *rtp == 0:
+						*rtp = port
+					case f[1] == "2" && *rtcp == 0:
+						*rtcp = port
 					}
 				}
 			}
 		case strings.HasPrefix(l, "a=rtcp:") && media == "audio":
 			s.RTCPPort, _ = strconv.Atoi(strings.Fields(l[len("a=rtcp:"):] + " ")[0])
+		case strings.HasPrefix(l, "a=rtcp:") && media == "video":
+			s.VideoRTCPPort, _ = strconv.Atoi(strings.Fields(l[len("a=rtcp:"):] + " ")[0])
 		case strings.HasPrefix(l, "a=rtpmap:") && media == "audio":
 			pt, enc, ok := strings.Cut(l[len("a=rtpmap:"):], " ")
 			if n, err := strconv.Atoi(pt); ok && err == nil {
@@ -271,6 +285,17 @@ func (s *sdpAudio) hasPCMU() bool {
 // 20 ms, sendrecv. rejectVideo adds a refused video stream (port 0), for an
 // answer to an offer that had one.
 func buildSDP(ip string, port int, sessID int64, rejectVideo bool, codecs ...sipCodec) []byte {
+	return buildSDPFull(ip, port, sessID, rejectVideo, false, codecs...)
+}
+
+// sipVideoPT: H.264 toward the phone's engine, as its own offers name it.
+const sipVideoPT = 109
+
+// buildSDPFull: buildSDP, plus (video) an H.264 stream for the phone's
+// engine on the same port as the audio (through the Berry Bridge relay the
+// phone reaches only that one; RTP, RTCP and video are told apart by
+// payload type). The m= line is the one EBMService accepted on 2026-11-02.
+func buildSDPFull(ip string, port int, sessID int64, rejectVideo, video bool, codecs ...sipCodec) []byte {
 	if len(codecs) == 0 {
 		codecs = []sipCodec{codecPCMU}
 	}
@@ -295,7 +320,13 @@ func buildSDP(ip string, port int, sessID int64, rejectVideo bool, codecs ...sip
 	// the RTCP one only timed out after ~5 s. There it reaches us and its
 	// probes are echoed (it knows no rtcp-mux, but reads a=rtcp).
 	lines = append(lines, fmt.Sprintf("a=rtcp:%d", port), "a=ptime:20", "a=sendrecv")
-	if rejectVideo {
+	switch {
+	case video:
+		lines = append(lines, fmt.Sprintf("m=video %d RTP/AVP %d", port, sipVideoPT),
+			fmt.Sprintf("a=rtpmap:%d H264/90000", sipVideoPT),
+			fmt.Sprintf("a=fmtp:%d profile-level-id=42e01f;packetization-mode=1", sipVideoPT),
+			fmt.Sprintf("a=rtcp:%d", port), "a=sendrecv")
+	case rejectVideo:
 		lines = append(lines, "m=video 0 RTP/AVP 109")
 	}
 	return []byte(strings.Join(lines, "\r\n") + "\r\n")
@@ -338,7 +369,9 @@ type sipRTP struct {
 	// the phone's ICE credentials and RTCP port, for our connectivity checks
 	iceUfrag, icePwd string
 	rtcpPort         int
-	frame            int // samples per 20 ms packet in down: 160 (PCMU, 8 kHz) or 320 (Opus, 16 kHz)
+	extraChecks      []int     // more of the phone's ports for ICE checks (its video's)
+	video            *sipVideo // the peer's video to the phone, when negotiated
+	frame            int       // samples per 20 ms packet in down: 160 (PCMU, 8 kHz) or 320 (Opus, 16 kHz)
 	enc              *bbOpusEncoder
 	dec              *bbOpusDecoder
 
@@ -399,6 +432,9 @@ func (r *sipRTP) start() {
 func (r *sipRTP) close() {
 	r.stopOnce.Do(func() {
 		close(r.stop)
+		if r.video != nil {
+			r.video.close()
+		}
 		_ = r.conn.Close()
 		r.wg.Wait()
 		r.enc.close()
@@ -427,6 +463,13 @@ func (r *sipRTP) WritePCM(pcm []float32) error {
 }
 
 func (r *sipRTP) Close() {}
+
+// WriteVideo takes one of the peer's video frames (session.go).
+func (r *sipRTP) WriteVideo(au media.AccessUnit) {
+	if v := r.video; v != nil {
+		v.feed(au)
+	}
+}
 
 // sender sends one packet every 20 ms from the start: audio when there is
 // some, silence otherwise. Sending first also opens the server's stateful
@@ -458,6 +501,9 @@ func (r *sipRTP) sender() {
 					rtcp = dst.Port + 1
 				}
 				_, _ = r.conn.WriteTo(stunBindingRequestFor(r.iceUfrag, r.icePwd), &net.UDPAddr{IP: dst.IP, Port: rtcp})
+				for _, p := range r.extraChecks {
+					_, _ = r.conn.WriteTo(stunBindingRequestFor(r.iceUfrag, r.icePwd), &net.UDPAddr{IP: dst.IP, Port: p})
+				}
 			}
 		}
 		tick++

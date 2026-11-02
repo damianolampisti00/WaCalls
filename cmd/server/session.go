@@ -86,7 +86,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid,
 			StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 		})
-		s.mgr.broker.emitIncoming(s.id, c.CallID, c.PeerJid)
+		s.mgr.broker.emitIncoming(s.id, c.CallID, c.PeerJid, c.MediaType == core.CallMediaTypeVideo)
 	}
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
@@ -109,22 +109,42 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		s.mgr.broker.upsertCall(rec)
 	}
+	// The peer's video: one depacketizer per stream; frames to the call's
+	// bridge (the phone's engine, sipvideo.go) and, -wa-video-dump, a file.
 	var dumpMu sync.Mutex
 	dumps := map[uint32]*videoDump{}
-	if videoDumpDir != "" {
-		cm.OnPeerVideo = func(p *media.RtpPacket) {
-			dumpMu.Lock()
-			d, ok := dumps[p.Header.Ssrc]
-			if !ok {
-				var err error
-				if d, err = newVideoDump(callID, p.Header.Ssrc); err != nil {
+	depacks := map[uint32]*media.H264Depacketizer{}
+	cm.OnPeerVideo = func(p *media.RtpPacket) {
+		ssrc := p.Header.Ssrc
+		dumpMu.Lock()
+		dp := depacks[ssrc]
+		if dp == nil {
+			dp = &media.H264Depacketizer{}
+			depacks[ssrc] = dp
+			if videoDumpDir != "" {
+				d, err := newVideoDump(callID, ssrc)
+				if err != nil {
 					s.log.Warn("video dump", "err", err)
 				}
-				dumps[p.Header.Ssrc] = d
+				dumps[ssrc] = d
 			}
-			dumpMu.Unlock()
+		}
+		aus := dp.Push(p.Header.SequenceNumber, p.Header.Timestamp, p.Header.Marker, p.Payload)
+		d := dumps[ssrc]
+		dumpMu.Unlock()
+		if len(aus) == 0 {
+			return
+		}
+		var sink interface{ WriteVideo(media.AccessUnit) }
+		if ac, ok := s.reg.get(callID); ok && ac.bridge != nil {
+			sink, _ = ac.bridge.(interface{ WriteVideo(media.AccessUnit) })
+		}
+		for _, au := range aus {
 			if d != nil {
-				d.push(p.Header.SequenceNumber, p.Header.Timestamp, p.Header.Marker, p.Payload)
+				d.write(au)
+			}
+			if sink != nil {
+				sink.WriteVideo(au)
 			}
 		}
 	}

@@ -144,6 +144,7 @@ type sipCall struct {
 	offer      *sdpAudio
 	codec      sipCodec // the call's audio, from the SDP exchange
 	delayed    bool     // our INVITE carried no SDP: the phone offers in its 200 OK
+	video      bool     // a WhatsApp video call: we offer the phone video too
 	user       string   // our INVITE's From (calls to the phone)
 	display    string
 	rtp        *sipRTP
@@ -450,7 +451,8 @@ func (g *sipGateway) events(ctx context.Context, sub *subscriber) {
 		switch ev["type"] {
 		case "incoming":
 			peer, _ := ev["peer"].(string)
-			g.ringPhone(id, peer)
+			video, _ := ev["video"].(bool)
+			g.ringPhone(id, peer, video)
 		case "incoming-claimed":
 			if owner, _ := ev["owner"].(string); owner != sipOwner {
 				g.waEnded(id, "claimed")
@@ -466,7 +468,7 @@ func (g *sipGateway) events(ctx context.Context, sub *subscriber) {
 	}
 }
 
-func (g *sipGateway) ringPhone(waID, peerJID string) {
+func (g *sipGateway) ringPhone(waID, peerJID string, video bool) {
 	g.mu.Lock()
 	p := g.phone
 	busy := len(g.calls) > 0
@@ -488,12 +490,15 @@ func (g *sipGateway) ringPhone(waID, peerJID string) {
 	c := &sipCall{waID: waID, sipID: sipRandom(12) + "@" + g.cfg.Domain, fromUs: true, phone: p,
 		localTag: sipRandom(6), target: p.contact, cseq: 1, mediaIP: ip, sessionID: time.Now().Unix(), pendingRTP: conn}
 	c.user, c.display = user, display
-	c.delayed = g.cfg.Opus && g.cfg.DelayedOffer
+	c.video = video
+	// The phone takes a call as video only from an offer with video in it,
+	// so a video call is offered (no delayed offer: audio likely PCMU).
+	c.delayed = g.cfg.Opus && g.cfg.DelayedOffer && !video
 	g.mu.Lock()
 	g.calls[waID] = c
 	g.dialog[c.sipID] = c
 	g.mu.Unlock()
-	g.log.Info("ringing the phone", "call_id", waID, "from", display, "delayed_offer", c.delayed)
+	g.log.Info("ringing the phone", "call_id", waID, "from", display, "delayed_offer", c.delayed, "video", video)
 	if err := g.sendInvite(c); err != nil {
 		g.log.Warn("INVITE to the phone failed", "err", err)
 		g.forget(c)
@@ -523,7 +528,7 @@ func (g *sipGateway) sendInvite(c *sipCall) error {
 	inv.Add("User-Agent", "WaCalls")
 	if !c.delayed {
 		inv.Add("Content-Type", "application/sdp")
-		inv.Body = buildSDP(ip, c.pendingRTP.LocalPort(), c.sessionID, false, g.offerCodecs()...)
+		inv.Body = buildSDPFull(ip, c.pendingRTP.LocalPort(), c.sessionID, false, c.video, g.offerCodecs()...)
 	}
 	c.invite = inv
 	return p.send(inv)
@@ -848,6 +853,23 @@ func (g *sipGateway) startMedia(c *sipCall, remote *sdpAudio) {
 	pacer := newBBUpPacer(func(pcm []float32) { g.be.Feed(waID, pcm) })
 	rtp := newSIPRTP(c.pendingRTP, dst, c.codec, pacer.push, g.log.With("call_id", waID))
 	rtp.iceUfrag, rtp.icePwd, rtp.rtcpPort = remote.Ufrag, remote.Pwd, rtcpPort
+	if c.video && remote.Video && remote.VideoPort > 0 {
+		vdst := &net.UDPAddr{IP: dst.IP, Port: remote.VideoPort}
+		vrtcp := remote.VideoRTCPPort
+		if c.phone.newMedia != nil && remote.VideoHostPort > 0 {
+			vdst.Port, vrtcp = remote.VideoHostPort, remote.VideoHostRTCPPort
+		}
+		if vrtcp == 0 {
+			vrtcp = vdst.Port + 1
+		}
+		rtp.extraChecks = []int{vdst.Port, vrtcp}
+		v := newSIPVideo(c.pendingRTP, vdst, g.log.With("call_id", waID))
+		if err := v.start(); err != nil {
+			g.log.Warn("video to the phone not started", "err", err)
+		} else {
+			rtp.video = v
+		}
+	}
 	g.mu.Lock()
 	c.rtp, c.pacer, c.pendingRTP = rtp, pacer, nil
 	g.mu.Unlock()
