@@ -17,6 +17,18 @@ func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, 
 		return
 	}
 	callID := info.CallID
+	// The same offer again (2026-11-02 22:36: a second copy 0.7 s later):
+	// its call key was already used, so decrypting it fails ("old counter"),
+	// and taking it as a new call threw away the one ringing on the phone,
+	// keys and all, and the call was rejected with reason "enc". Keep the
+	// call we have.
+	m.mu.Lock()
+	dup := m.currentCall != nil && m.currentCall.CallID == callID
+	m.mu.Unlock()
+	if dup {
+		m.log.Info("duplicate call offer ignored", "call_id", callID, "count", wanode.AttrString(info.InnerNode.Attrs, "count"))
+		return
+	}
 	creator := wanode.AttrString(info.InnerNode.Attrs, "call-creator")
 	if creator == "" {
 		creator = peerJid.String()

@@ -1,10 +1,14 @@
 package call
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
 	"wacalls/internal/voip/core"
+
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // Incoming media path: once a relay connects for an accepted incoming call
@@ -45,5 +49,20 @@ func TestOnRelayConnectedOnlyPromotesConnecting(t *testing.T) {
 	if m2 := (&CallManager{log: slog.Default()}); m2.currentCall == nil {
 		// nil currentCall must not panic.
 		m2.onRelayConnected()
+	}
+}
+
+// A second copy of the offer for the call we already have must not replace
+// it (its key no longer decrypts). With no socket, handling it as new would
+// panic in the key decryption.
+func TestDuplicateOfferKeepsTheCall(t *testing.T) {
+	m := &CallManager{log: slog.Default()}
+	first := NewIncomingCall("CID", "peer@lid", "creator@lid", "", core.CallMediaTypeAudio)
+	m.currentCall = first
+	offer := waBinary.Node{Tag: "call", Attrs: waBinary.Attrs{"from": "peer@lid"},
+		Content: []waBinary.Node{{Tag: "offer", Attrs: waBinary.Attrs{"call-id": "CID", "call-creator": "creator@lid", "count": "1"}}}}
+	m.HandleCallOffer(context.Background(), &offer, types.NewJID("peer", types.HiddenUserServer))
+	if m.currentCall != first {
+		t.Fatal("the duplicate offer replaced the call")
 	}
 }
