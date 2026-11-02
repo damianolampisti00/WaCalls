@@ -85,6 +85,7 @@ type bbGateway struct {
 	// sipPhone, when set, says a phone is registered on the SIP gateway
 	// (sipgateway.go): incoming calls then ring there, not in this app.
 	sipPhone func() bool
+	sipGW    *sipGateway // nil: no SIP relay (sip.open is refused)
 
 	mu     sync.Mutex
 	conn   *bbConn // the phone connected now (a new connection replaces it)
@@ -141,6 +142,11 @@ type bbConn struct {
 	enc     *bbOpusEncoder
 	dec     *bbOpusDecoder
 	pending []int16
+
+	// SIP relayed by the app for the phone's native call engine (bbsiptunnel.go)
+	sipMu  sync.Mutex
+	sip    *bbSIPTunnel
+	tunSeq atomic.Uint32
 }
 
 type bbMsg struct {
@@ -201,6 +207,7 @@ func (g *bbGateway) handleWS(w http.ResponseWriter, r *http.Request) {
 	g.reader(c)
 
 	cancel()
+	c.closeSIPTunnel()
 	g.broker.unsubscribe(c.sub)
 	c.codecMu.Lock()
 	c.enc.close()
@@ -403,6 +410,9 @@ func (g *bbGateway) reader(c *bbConn) {
 			return
 		}
 		if typ == websocket.MessageBinary {
+			if g.onTunnelFrame(c, data) {
+				continue
+			}
 			g.onAudio(c, data)
 			continue
 		}
@@ -526,6 +536,13 @@ func (g *bbGateway) onControl(c *bbConn, msg map[string]any) {
 	switch typ {
 	case "ping":
 		c.sendJSON(map[string]any{"type": "pong", "t": msg["t"]})
+	case "sip.open":
+		resume, _ := msg["resume"].(bool)
+		if err := g.openSIPTunnel(c, resume); err != nil {
+			fail(err)
+		}
+	case "sip.close":
+		c.closeSIPTunnel()
 	case "audio.codec":
 		if str("codec") != "opus" {
 			c.opus.Store(false)

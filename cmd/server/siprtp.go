@@ -212,15 +212,32 @@ func buildSDP(ip string, port int, sessID int64, rejectVideo bool) []byte {
 // ---- RTP session -----------------------------------------------------------
 
 const (
-	rtpFrame       = 160 // 20 ms at 8 kHz
-	rtpPrebuffer   = 2 * rtpFrame
+	rtpFrame = 160 // 20 ms at 8 kHz
+	// WhatsApp's audio comes in 60 ms blocks: start (and restart after a
+	// gap) with 80 ms queued, or every block boundary is an underrun.
+	rtpPrebuffer   = 4 * rtpFrame
 	rtpMaxBuffered = 20 * rtpFrame // 400 ms: beyond this the oldest audio goes
 )
 
-// sipRTP is one call's media: a UDP socket on our side, the phone's address
+// rtpTransport carries RTP datagrams: a UDP socket (udpTransport) or the
+// Berry Bridge link when the phone reaches us through it (tunnelRTP).
+type rtpTransport interface {
+	WriteTo(p []byte, dst *net.UDPAddr) (int, error)
+	ReadFrom(p []byte) (int, *net.UDPAddr, error) // blocks; an error once closed
+	Close() error
+	LocalPort() int
+}
+
+type udpTransport struct{ *net.UDPConn }
+
+func (u udpTransport) WriteTo(p []byte, dst *net.UDPAddr) (int, error) { return u.WriteToUDP(p, dst) }
+func (u udpTransport) ReadFrom(p []byte) (int, *net.UDPAddr, error)    { return u.ReadFromUDP(p) }
+func (u udpTransport) LocalPort() int                                  { return u.LocalAddr().(*net.UDPAddr).Port }
+
+// sipRTP is one call's media: a socket on our side, the phone's address
 // from its SDP (then whatever address its packets really come from).
 type sipRTP struct {
-	conn   *net.UDPConn
+	conn   rtpTransport
 	log    *slog.Logger
 	remote atomic.Pointer[net.UDPAddr]
 	ssrc   uint32
@@ -240,17 +257,17 @@ type sipRTP struct {
 }
 
 // listenRTP opens a UDP socket on ip at the first free even port of [lo, hi].
-func listenRTP(ip string, lo, hi int) (*net.UDPConn, error) {
+func listenRTP(ip string, lo, hi int) (rtpTransport, error) {
 	for p := lo &^ 1; p <= hi; p += 2 {
 		c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(ip), Port: p})
 		if err == nil {
-			return c, nil
+			return udpTransport{c}, nil
 		}
 	}
 	return nil, fmt.Errorf("rtp: no free port in %d-%d on %s", lo, hi, ip)
 }
 
-func newSIPRTP(conn *net.UDPConn, remote *net.UDPAddr, onUp func([]float32), log *slog.Logger) *sipRTP {
+func newSIPRTP(conn rtpTransport, remote *net.UDPAddr, onUp func([]float32), log *slog.Logger) *sipRTP {
 	r := &sipRTP{conn: conn, log: log, onUp: onUp, stop: make(chan struct{})}
 	var b [4]byte
 	_, _ = rand.Read(b[:])
@@ -259,7 +276,7 @@ func newSIPRTP(conn *net.UDPConn, remote *net.UDPAddr, onUp func([]float32), log
 	return r
 }
 
-func (r *sipRTP) localPort() int { return r.conn.LocalAddr().(*net.UDPAddr).Port }
+func (r *sipRTP) localPort() int { return r.conn.LocalPort() }
 
 func (r *sipRTP) start() {
 	r.wg.Add(2)
@@ -334,7 +351,7 @@ func (r *sipRTP) sender() {
 			pkt[12+i] = ulawEncode(floatToInt16(v))
 		}
 		if dst := r.remote.Load(); dst != nil {
-			if _, err := r.conn.WriteToUDP(pkt, dst); err == nil {
+			if _, err := r.conn.WriteTo(pkt, dst); err == nil {
 				r.sent.Add(1)
 			}
 		}
@@ -348,7 +365,7 @@ func (r *sipRTP) receiver() {
 	buf := make([]byte, 2048)
 	var latched bool
 	for {
-		n, from, err := r.conn.ReadFromUDP(buf)
+		n, from, err := r.conn.ReadFrom(buf)
 		if err != nil {
 			select {
 			case <-r.stop:

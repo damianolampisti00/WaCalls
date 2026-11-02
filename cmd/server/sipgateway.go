@@ -30,6 +30,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +40,11 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-const sipOwner = "sip"
+const (
+	sipOwner = "sip"
+	// registration lifetime granted over the Berry Bridge link, seconds
+	sipTunnelExpires = 600
+)
 
 // sipBackend is what the gateway needs from the WhatsApp side (sessionBackend
 // in production, a fake in tests).
@@ -68,17 +73,22 @@ type sipGateway struct {
 	cfg    sipConfig
 	log    *slog.Logger
 
-	mu     sync.Mutex
-	phone  *sipPhone
-	calls  map[string]*sipCall // by WhatsApp call ID
-	dialog map[string]*sipCall // by SIP Call-ID
+	mu    sync.Mutex
+	phone *sipPhone
+	// the last registration over the Berry Bridge link (serveTunnel resume)
+	tunnelContact, tunnelAOR string
+	calls                    map[string]*sipCall // by WhatsApp call ID
+	dialog                   map[string]*sipCall // by SIP Call-ID
 }
 
 type sipPhone struct {
-	conn    net.Conn
-	wmu     sync.Mutex
-	contact string // the phone's registered Contact URI
-	aor     string // its address of record (To of the REGISTER)
+	conn net.Conn
+	// newMedia, for a phone reaching us through the Berry Bridge link
+	// (serveTunnel), opens a call's RTP on that link; nil: UDP sockets.
+	newMedia func() (rtpTransport, error)
+	wmu      sync.Mutex
+	contact  string // the phone's registered Contact URI
+	aor      string // its address of record (To of the REGISTER)
 }
 
 func (p *sipPhone) send(m *sipMsg) error {
@@ -114,7 +124,7 @@ type sipCall struct {
 	pacer      *bbUpPacer
 	mediaIP    string
 	sessionID  int64
-	pendingRTP *net.UDPConn
+	pendingRTP rtpTransport
 }
 
 func newSIPGateway(be sipBackend, broker *Broker, cfg sipConfig, log *slog.Logger) *sipGateway {
@@ -184,7 +194,29 @@ func (g *sipGateway) allowed(a net.Addr) bool {
 
 func (g *sipGateway) handleConn(ctx context.Context, c net.Conn) {
 	g.log.Info("sip connection", "from", c.RemoteAddr())
-	p := &sipPhone{conn: c}
+	g.readLoop(ctx, &sipPhone{conn: c})
+}
+
+// serveTunnel runs a phone that reaches us through the Berry Bridge link
+// (bbgateway.go, sip.open): c carries its SIP stream, newMedia its RTP.
+// resume: the link came back while the phone's engine kept its own
+// connection to the relay, so it won't register again for a while: it is
+// taken as registered with the contact of its last REGISTER.
+func (g *sipGateway) serveTunnel(ctx context.Context, c net.Conn, newMedia func() (rtpTransport, error), resume bool) {
+	p := &sipPhone{conn: c, newMedia: newMedia}
+	g.mu.Lock()
+	if resume && g.tunnelContact != "" {
+		p.contact, p.aor = g.tunnelContact, g.tunnelAOR
+		g.phone = p
+		g.log.Info("phone registration resumed over the Berry Bridge link", "contact", p.contact)
+	}
+	g.mu.Unlock()
+	g.log.Info("sip over the Berry Bridge link")
+	g.readLoop(ctx, p)
+}
+
+func (g *sipGateway) readLoop(ctx context.Context, p *sipPhone) {
+	c := p.conn
 	defer func() {
 		_ = c.Close()
 		g.mu.Lock()
@@ -270,6 +302,11 @@ func (g *sipGateway) onRegister(p *sipPhone, m *sipMsg) {
 	if exp == "" {
 		exp = "3600"
 	}
+	if n, err := strconv.Atoi(exp); p.newMedia != nil && err == nil && n > sipTunnelExpires {
+		// Over the link: refresh often, so a server restart (which loses
+		// the registration) costs minutes, not the engine's 12 hours.
+		exp = strconv.Itoa(sipTunnelExpires)
+	}
 	r := sipResponse(m, 200, "OK", sipRandom(4))
 	if contact != "" && contact != "*" {
 		r.Add("Contact", contact+";expires="+exp)
@@ -287,13 +324,27 @@ func (g *sipGateway) onRegister(p *sipPhone, m *sipMsg) {
 	}
 	p.contact = sipAddrURI(contact)
 	p.aor = m.Get("to")
+	if p.newMedia != nil {
+		g.tunnelContact, g.tunnelAOR = p.contact, p.aor
+	}
 	if g.phone != p {
 		g.log.Info("phone registered", "contact", p.contact, "from", p.conn.RemoteAddr(), "agent", m.Get("user-agent"))
 	}
 	g.phone = p
 }
 
+// openMedia opens a call's RTP for this phone.
+func (g *sipGateway) openMedia(p *sipPhone) (rtpTransport, error) {
+	if p.newMedia != nil {
+		return p.newMedia()
+	}
+	return listenRTP(g.mediaIPFor(p), g.cfg.RTPLo, g.cfg.RTPHi)
+}
+
 func (g *sipGateway) mediaIPFor(p *sipPhone) string {
+	if p.newMedia != nil {
+		return "127.0.0.1" // the relay on the phone itself
+	}
 	if g.cfg.MediaIP != "" {
 		return g.cfg.MediaIP
 	}
@@ -345,14 +396,14 @@ func (g *sipGateway) ringPhone(waID, peerJID string) {
 		user, display = "whatsapp", "WhatsApp"
 	}
 	ip := g.mediaIPFor(p)
-	conn, err := listenRTP(ip, g.cfg.RTPLo, g.cfg.RTPHi)
+	conn, err := g.openMedia(p)
 	if err != nil {
 		g.log.Error("cannot ring the phone", "err", err)
 		return
 	}
 	c := &sipCall{waID: waID, sipID: sipRandom(12) + "@" + g.cfg.Domain, fromUs: true, phone: p,
 		localTag: sipRandom(6), target: p.contact, cseq: 1, mediaIP: ip, sessionID: time.Now().Unix(), pendingRTP: conn}
-	port := conn.LocalAddr().(*net.UDPAddr).Port
+	port := conn.LocalPort()
 	inv := &sipMsg{Method: "INVITE", URI: p.contact}
 	inv.Add("Via", "SIP/2.0/TCP "+ip+";branch="+sipBranch())
 	inv.Add("Max-Forwards", "70")
@@ -544,7 +595,7 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 		if existing.rtp != nil {
 			port = existing.rtp.localPort()
 		} else if existing.pendingRTP != nil {
-			port = existing.pendingRTP.LocalAddr().(*net.UDPAddr).Port
+			port = existing.pendingRTP.LocalPort()
 		}
 		offer, _ := parseSDP(m.Body)
 		r.Body = buildSDP(existing.mediaIP, port, existing.sessionID+1, offer != nil && offer.Video)
@@ -570,7 +621,7 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 		return
 	}
 	ip := g.mediaIPFor(p)
-	conn, err := listenRTP(ip, g.cfg.RTPLo, g.cfg.RTPHi)
+	conn, err := g.openMedia(p)
 	if err != nil {
 		_ = p.send(sipResponse(m, 503, "Service Unavailable", sipRandom(4)))
 		return
@@ -606,7 +657,7 @@ func (g *sipGateway) waConnected(waID string) {
 	}
 	c.state = sipActive
 	g.mu.Unlock()
-	port := c.pendingRTP.LocalAddr().(*net.UDPAddr).Port
+	port := c.pendingRTP.LocalPort()
 	r := sipResponse(c.invite, 200, "OK", c.localTag)
 	r.Add("Contact", fmt.Sprintf("<sip:wacalls@%s;transport=tcp>", c.mediaIP))
 	r.Add("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS")
@@ -661,7 +712,7 @@ func (g *sipGateway) startMedia(c *sipCall, remote *sdpAudio) {
 	g.mu.Unlock()
 	rtp.start()
 	g.be.Attach(waID, rtp)
-	g.log.Info("sip media", "call_id", waID, "local", rtp.conn.LocalAddr(), "phone", dst)
+	g.log.Info("sip media", "call_id", waID, "local_port", rtp.localPort(), "phone", dst, "tunnel", c.phone.newMedia != nil)
 }
 
 func (g *sipGateway) forget(c *sipCall) {

@@ -102,6 +102,7 @@ func main() {
 		gw := newBBGateway(srv.sessions, srv.broker, string(token), *bbSession, log)
 		if sipGW != nil {
 			gw.sipPhone = sipGW.registered
+			gw.sipGW = sipGW
 		}
 		bbSrv = &http.Server{Addr: *bbAddr, Handler: gw.routes()}
 		go func() {
