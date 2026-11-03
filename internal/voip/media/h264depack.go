@@ -24,6 +24,9 @@ type AccessUnit struct {
 	Data []byte
 	TS   uint32
 	IDR  bool
+	// Rotation: the sender's video orientation (CVORotation), set by the
+	// caller from the stream's packets; 0 when it sends none.
+	Rotation int
 }
 
 func (d *H264Depacketizer) flush(out []AccessUnit) []AccessUnit {

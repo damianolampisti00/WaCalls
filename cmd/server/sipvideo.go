@@ -4,8 +4,9 @@ package main
 // WhatsApp sends (H.264 Main, 320x212 on 2026-11-03, keyframes every few
 // seconds) is not what the engine decodes: it wants one slice per frame and
 // takes 512x288 (its own size), and an unknown peer's H.264 in Eyeball's
-// "legacy" packets. So the server transcodes (ffmpeg: decode, scale with
-// black bars to 512x288, x264 baseline, one slice, a keyframe a second) and
+// "legacy" packets. So the server transcodes (ffmpeg: decode, turn upright
+// (CVO), scale with black bars to 512x288 or, portrait, 288x512, x264
+// baseline, one slice, a keyframe a second) and
 // packetizes like the experiment the engine decoded on 2026-11-02
 // (bbmvideo-re/server/mediaprobe.py, variant legacy): SPS and PPS as single
 // NAL packets, FU-A whose first fragment keeps the NAL header byte.
@@ -15,6 +16,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -31,23 +33,40 @@ const (
 	videoClock = 90000
 )
 
-// ffmpegArgs: raw H.264 in on stdin, the engine's H.264 out on stdout.
-var ffmpegArgs = []string{
-	"-hide_banner", "-loglevel", "error",
-	// (no -fflags nobuffer: with it 50 of the 122 frames of a real call
-	// were lost)
-	"-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
-	// steady input timestamps whatever the arrival (bursts included): the
-	// RTP timestamps toward the phone come from the wall clock (send)
-	"-framerate", "15", "-f", "h264", "-i", "pipe:0",
-	"-vf", "scale=512:288:force_original_aspect_ratio=decrease,pad=512:288:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-	// every frame out, also ones arriving in a burst (the same wall-clock
-	// timestamp would otherwise drop them as duplicates)
-	"-fps_mode", "passthrough",
-	"-c:v", "libx264", "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
-	"-tune", "zerolatency", "-preset", "veryfast", "-b:v", "300k", "-maxrate", "400k", "-bufsize", "400k",
-	"-g", "15", "-bf", "0", "-x264-params", "repeat-headers=1:aud=1:slices=1:sliced-threads=0:threads=1",
-	"-f", "h264", "pipe:1",
+// ffmpegArgs: raw H.264 in on stdin, the engine's H.264 out on stdout, for
+// the peer's orientation (CVO degrees, media.CVORotation): the picture is
+// turned upright and, held upright (90/270), sent portrait 288x512 instead
+// of a small pillarboxed picture in 512x288 (2026-11-03: the Q10 showed the
+// caller's portrait video lying on its side).
+func ffmpegArgs(rotation int) []string {
+	w, h, turn := 512, 288, ""
+	switch rotation {
+	case 90:
+		w, h, turn = 288, 512, "transpose=cclock,"
+	case 270:
+		w, h, turn = 288, 512, "transpose=clock,"
+	case 180:
+		turn = "hflip,vflip,"
+	}
+	vf := fmt.Sprintf("%sscale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+		turn, w, h, w, h)
+	return []string{
+		"-hide_banner", "-loglevel", "error",
+		// (no -fflags nobuffer: with it 50 of the 122 frames of a real call
+		// were lost)
+		"-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
+		// steady input timestamps whatever the arrival (bursts included): the
+		// RTP timestamps toward the phone come from the wall clock (send)
+		"-framerate", "15", "-f", "h264", "-i", "pipe:0",
+		"-vf", vf,
+		// every frame out, also ones arriving in a burst (the same wall-clock
+		// timestamp would otherwise drop them as duplicates)
+		"-fps_mode", "passthrough",
+		"-c:v", "libx264", "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
+		"-tune", "zerolatency", "-preset", "veryfast", "-b:v", "300k", "-maxrate", "400k", "-bufsize", "400k",
+		"-g", "15", "-bf", "0", "-x264-params", "repeat-headers=1:aud=1:slices=1:sliced-threads=0:threads=1",
+		"-f", "h264", "pipe:1",
+	}
 }
 
 type sipVideo struct {
@@ -55,86 +74,136 @@ type sipVideo struct {
 	dst  *net.UDPAddr
 	log  *slog.Logger
 	ssrc uint32
-	seq  uint16
 	t0   time.Time
+	path string // ffmpeg
 
-	in      chan []byte
+	sendMu sync.Mutex // seq: an old and a new transcoder may overlap
+	seq    uint16
+
+	mu      sync.Mutex // feed, close
+	cur     *transcoder
+	rot     int
+	closed  bool
 	waiting atomic.Bool // until the next WhatsApp keyframe (start, or after a drop)
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stop    chan struct{}
-	once    sync.Once
-	wg      sync.WaitGroup
 
-	fed, dropped, frames, pkts, keyframes atomic.Int64
+	fed, dropped, frames, pkts, keyframes, restarts atomic.Int64
+}
+
+// transcoder is one ffmpeg run, for one orientation of the peer's video.
+type transcoder struct {
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	in    chan []byte
+	stop  chan struct{}
+	wg    sync.WaitGroup
 }
 
 func newSIPVideo(conn rtpTransport, dst *net.UDPAddr, log *slog.Logger) *sipVideo {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	v := &sipVideo{conn: conn, dst: dst, log: log, ssrc: binary.BigEndian.Uint32(b[:]),
-		seq: uint16(b[0])<<8 | uint16(b[1]), in: make(chan []byte, 8), stop: make(chan struct{})}
+		seq: uint16(b[0])<<8 | uint16(b[1])}
 	v.waiting.Store(true)
 	return v
 }
 
+// start checks for ffmpeg; the transcoder itself starts at the peer's first
+// keyframe, when its orientation is known.
 func (v *sipVideo) start() error {
 	path, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		return err
 	}
-	v.cmd = exec.Command(path, ffmpegArgs...)
-	if v.stdin, err = v.cmd.StdinPipe(); err != nil {
-		return err
+	v.path, v.t0 = path, time.Now()
+	v.log.Info("video to the phone", "dst", v.dst, "ssrc", v.ssrc)
+	return nil
+}
+
+func (v *sipVideo) startTranscoder(rotation int) (*transcoder, error) {
+	t := &transcoder{cmd: exec.Command(v.path, ffmpegArgs(rotation)...), in: make(chan []byte, 8), stop: make(chan struct{})}
+	var err error
+	if t.stdin, err = t.cmd.StdinPipe(); err != nil {
+		return nil, err
 	}
-	out, err := v.cmd.StdoutPipe()
+	out, err := t.cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var stderr bytes.Buffer
-	v.cmd.Stderr = &stderr
-	if err := v.cmd.Start(); err != nil {
-		return err
+	t.cmd.Stderr = &stderr
+	if err := t.cmd.Start(); err != nil {
+		return nil, err
 	}
-	v.t0 = time.Now()
-	v.wg.Add(2)
+	t.wg.Add(2)
 	go func() { // WhatsApp frames into ffmpeg
-		defer v.wg.Done()
+		defer t.wg.Done()
 		for {
 			select {
-			case <-v.stop:
+			case <-t.stop:
 				return
-			case au := <-v.in:
-				if _, err := v.stdin.Write(au); err != nil {
+			case au := <-t.in:
+				if _, err := t.stdin.Write(au); err != nil {
 					return
 				}
 			}
 		}
 	}()
 	go func() { // ffmpeg's frames to the phone
-		defer v.wg.Done()
+		defer t.wg.Done()
 		v.readAUs(out, v.send)
-		_ = v.cmd.Wait()
+		_ = t.cmd.Wait()
 		if stderr.Len() > 0 {
 			v.log.Warn("video transcoder", "stderr", stderr.String())
 		}
 	}()
-	v.log.Info("video to the phone", "dst", v.dst, "ssrc", v.ssrc)
-	return nil
+	return t, nil
+}
+
+func (t *transcoder) close() {
+	close(t.stop)
+	_ = t.stdin.Close()
+	if t.cmd.Process != nil {
+		_ = t.cmd.Process.Kill()
+	}
+	t.wg.Wait()
 }
 
 // feed takes one of the peer's frames. Frames start at a keyframe, and a
 // dropped frame (transcoder behind) waits for the next one: a decoder
-// handed a frame whose reference is missing paints garbage.
+// handed a frame whose reference is missing paints garbage. A keyframe with
+// a new orientation restarts the transcoder for it.
 func (v *sipVideo) feed(au media.AccessUnit) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return
+	}
 	if v.waiting.Load() {
 		if !au.IDR {
 			return
 		}
 		v.waiting.Store(false)
 	}
+	if au.IDR && (v.cur == nil || au.Rotation != v.rot) {
+		if v.cur != nil {
+			v.cur.close()
+			v.restarts.Add(1)
+		}
+		t, err := v.startTranscoder(au.Rotation)
+		if err != nil {
+			v.cur = nil
+			v.waiting.Store(true)
+			v.log.Warn("video transcoder not started", "err", err)
+			return
+		}
+		v.cur, v.rot = t, au.Rotation
+		v.log.Info("video to the phone: orientation", "rotation", au.Rotation)
+	}
+	if v.cur == nil {
+		return
+	}
 	select {
-	case v.in <- au.Data:
+	case v.cur.in <- au.Data:
 		v.fed.Add(1)
 	default:
 		v.dropped.Add(1)
@@ -143,18 +212,19 @@ func (v *sipVideo) feed(au media.AccessUnit) {
 }
 
 func (v *sipVideo) close() {
-	v.once.Do(func() {
-		close(v.stop)
-		if v.stdin != nil {
-			_ = v.stdin.Close()
-		}
-		if v.cmd != nil && v.cmd.Process != nil {
-			_ = v.cmd.Process.Kill()
-		}
-		v.wg.Wait()
-		v.log.Info("video to the phone closed", "fed", v.fed.Load(), "dropped", v.dropped.Load(),
-			"frames", v.frames.Load(), "keyframes", v.keyframes.Load(), "packets", v.pkts.Load())
-	})
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return
+	}
+	v.closed = true
+	if v.cur != nil {
+		v.cur.close()
+		v.cur = nil
+	}
+	v.log.Info("video to the phone closed", "fed", v.fed.Load(), "dropped", v.dropped.Load(),
+		"frames", v.frames.Load(), "keyframes", v.keyframes.Load(), "packets", v.pkts.Load(),
+		"restarts", v.restarts.Load())
 }
 
 // readAUs splits an Annex-B stream into access units, an access unit
@@ -250,6 +320,8 @@ func (v *sipVideo) send(nals [][]byte) {
 		return
 	}
 	ts := uint32(time.Since(v.t0).Seconds() * videoClock)
+	v.sendMu.Lock()
+	defer v.sendMu.Unlock()
 	for i, p := range pays {
 		pkt := make([]byte, 12, 12+len(p))
 		pkt[0] = 0x80

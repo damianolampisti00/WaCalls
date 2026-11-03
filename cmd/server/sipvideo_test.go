@@ -7,6 +7,7 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,5 +149,86 @@ func TestSIPVideoTranscodesToTheEngine(t *testing.T) {
 	}
 	if sps == nil || sps[1] != 66 { // profile_idc 66 = baseline
 		t.Fatalf("SPS % x", sps)
+	}
+}
+
+func TestFFmpegArgsTurnThePeerUpright(t *testing.T) {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("no ffmpeg")
+	}
+	src, err := exec.Command("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x212:rate=10", "-t", "1",
+		"-pix_fmt", "yuv420p", "-c:v", "libx264", "-f", "h264", "-").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rot, want := range map[int]string{0: "512x288", 90: "288x512", 180: "512x288", 270: "288x512"} {
+		cmd := exec.Command("ffmpeg", ffmpegArgs(rot)...)
+		cmd.Stdin = bytes.NewReader(src)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("rotation %d: %v", rot, err)
+		}
+		probe := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+			"-of", "csv=s=x:p=0", "-f", "h264", "-")
+		probe.Stdin = bytes.NewReader(out)
+		got, err := probe.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(string(got)) != want {
+			t.Fatalf("rotation %d: %q, want %s", rot, got, want)
+		}
+	}
+}
+
+func TestSIPVideoRestartsOnANewOrientation(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("no ffmpeg")
+	}
+	src, err := exec.Command("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x212:rate=10", "-t", "4",
+		"-pix_fmt", "yuv420p", "-c:v", "libx264", "-profile:v", "main", "-bf", "0", "-g", "10",
+		"-x264-params", "aud=1:repeat-headers=1", "-f", "h264", "-").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aus []media.AccessUnit
+	(&sipVideo{}).readAUs(bytes.NewReader(src), func(nals [][]byte) {
+		var au media.AccessUnit
+		for _, n := range nals {
+			au.Data = append(append(au.Data, 0, 0, 0, 1), n...)
+			au.IDR = au.IDR || n[0]&0x1f == 5
+		}
+		aus = append(aus, au)
+	})
+	var mu sync.Mutex
+	frames := 0
+	tr := newTunnelRTP(func(_ int, p []byte) bool {
+		if p[1]&0x80 != 0 {
+			mu.Lock()
+			frames++
+			mu.Unlock()
+		}
+		return true
+	})
+	v := newSIPVideo(tr, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45538}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := v.start(); err != nil {
+		t.Fatal(err)
+	}
+	for i, au := range aus {
+		if i >= len(aus)/2 {
+			au.Rotation = 90 // the peer turned its phone: from the next keyframe
+		}
+		v.feed(au)
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(time.Second)
+	v.close()
+	mu.Lock()
+	defer mu.Unlock()
+	if v.restarts.Load() != 1 || v.rot != 90 {
+		t.Fatalf("restarts %d rotation %d", v.restarts.Load(), v.rot)
+	}
+	if frames < len(aus)/2 {
+		t.Fatalf("frames %d of %d", frames, len(aus))
 	}
 }

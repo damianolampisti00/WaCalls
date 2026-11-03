@@ -114,6 +114,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	var dumpMu sync.Mutex
 	dumps := map[uint32]*videoDump{}
 	depacks := map[uint32]*media.H264Depacketizer{}
+	rots := map[uint32]int{} // each stream's last orientation (CVO)
 	cm.OnPeerVideo = func(p *media.RtpPacket) {
 		ssrc := p.Header.Ssrc
 		dumpMu.Lock()
@@ -129,9 +130,16 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 				dumps[ssrc] = d
 			}
 		}
+		if deg, ok := media.CVORotation(p.Header); ok {
+			rots[ssrc] = deg
+		}
+		rot := rots[ssrc]
 		aus := dp.Push(p.Header.SequenceNumber, p.Header.Timestamp, p.Header.Marker, p.Payload)
 		d := dumps[ssrc]
 		dumpMu.Unlock()
+		for i := range aus {
+			aus[i].Rotation = rot
+		}
 		if len(aus) == 0 {
 			return
 		}
