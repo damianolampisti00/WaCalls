@@ -103,8 +103,12 @@ func (c *callCapture) media(out bool, data []byte) {
 	binary.BigEndian.PutUint16(ip[24:], uint16(8+len(data)))
 	copy(ip[28:], data)
 	_, _ = c.pcap.Write(pkt)
-	if c.in == 1 || c.in%500 == 0 {
-		c.writeKeysLocked()
+	if !out && (c.in == 1 || c.in%500 == 0) {
+		// Not here: media is the CallManager's OnRawMedia, which runs with
+		// the manager's lock held on the send path, and KeyInfo takes that
+		// lock (2026-11-03: a self-deadlock that froze every call and
+		// WhatsApp node handling after a phone hangup).
+		go c.writeKeys()
 	}
 }
 
@@ -119,7 +123,9 @@ func (c *callCapture) event(dir, kind, text string) {
 	_, _ = c.events.Write(append(b, '\n'))
 }
 
-func (c *callCapture) writeKeysLocked() {
+// writeKeys saves the call's keys. It takes the CallManager's lock (KeyInfo):
+// never call it with c.mu held or from a CallManager callback.
+func (c *callCapture) writeKeys() {
 	if c.cm == nil {
 		return
 	}
@@ -128,12 +134,12 @@ func (c *callCapture) writeKeysLocked() {
 }
 
 func (c *callCapture) close() string {
+	c.writeKeys()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.pcap == nil {
 		return c.dir
 	}
-	c.writeKeysLocked()
 	b, _ := json.Marshal(map[string]any{"t_ms": time.Since(c.start).Milliseconds(), "dir": "-", "kind": "end",
 		"text": fmt.Sprintf("packets in %d out %d", c.in, c.out)})
 	_, _ = c.events.Write(append(b, '\n'))
