@@ -88,6 +88,7 @@ func main() {
 		sipGW = newSIPGateway(be, srv.broker, sipConfig{Domain: *sipDomain, MediaIP: *sipMediaIP,
 			RTPLo: lo, RTPHi: hi, Allow: allow,
 			StateFile: filepath.Join(filepath.Dir(*dbPath), "sip_tunnel.json"), Opus: *sipOpus, DelayedOffer: *sipDelayed}, log)
+		sipGW.watch(ctx) // incoming calls ring the phone over the tunnel even without the LAN listener
 		go func() {
 			// At boot the LAN address may not be up yet (pm2 starts after
 			// network.target): wait for it instead of exiting, or pm2 gives

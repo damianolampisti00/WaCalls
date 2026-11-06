@@ -100,6 +100,7 @@ type sipGateway struct {
 	tunnelContact, tunnelAOR string
 	calls                    map[string]*sipCall // by WhatsApp call ID
 	dialog                   map[string]*sipCall // by SIP Call-ID
+	watching                 bool                // subscribed to the call events (watch)
 }
 
 type sipPhone struct {
@@ -233,10 +234,26 @@ func (g *sipGateway) owns(waID string) bool {
 	return ok
 }
 
-func (g *sipGateway) serve(ctx context.Context, ln net.Listener) error {
+// watch subscribes the gateway to the WhatsApp call events (once). It must
+// not wait for the LAN listener: the phone reaches the gateway through the
+// Berry Bridge tunnel too, and without events incoming calls never ring it
+// (6/11: after a reboot the LAN address changed, the listener never came up
+// and every incoming call was silently missed).
+func (g *sipGateway) watch(ctx context.Context) {
+	g.mu.Lock()
+	if g.watching {
+		g.mu.Unlock()
+		return
+	}
+	g.watching = true
+	g.mu.Unlock()
 	sub := g.broker.subscribe("sip-gateway")
-	defer g.broker.unsubscribe(sub)
+	go func() { <-ctx.Done(); g.broker.unsubscribe(sub) }()
 	go g.events(ctx, sub)
+}
+
+func (g *sipGateway) serve(ctx context.Context, ln net.Listener) error {
+	g.watch(ctx)
 	go func() { <-ctx.Done(); _ = ln.Close() }()
 	for {
 		c, err := ln.Accept()
@@ -474,6 +491,7 @@ func (g *sipGateway) ringPhone(waID, peerJID string, video bool) {
 	busy := len(g.calls) > 0
 	g.mu.Unlock()
 	if p == nil || busy {
+		g.log.Info("not ringing the phone", "call_id", waID, "registered", p != nil, "busy", busy)
 		return
 	}
 	num := strings.TrimPrefix(g.be.PhoneOf(peerJID), "+")

@@ -187,3 +187,37 @@ func TestTunnelLagExcessOverMinimum(t *testing.T) {
 		t.Fatalf("lag %d max %d outQ max %d, want 2000 2000 5", l.lag, l.maxLag, l.maxOutQ)
 	}
 }
+
+// The LAN listener may never come up (6/11: the server's address changed
+// after a reboot): a phone registered over the link must still ring.
+func TestTunnelRingsWithoutLANListener(t *testing.T) {
+	broker := NewBroker()
+	sipGW := newSIPGateway(&fakeBackend{}, broker, sipConfig{}, slog.Default())
+	gctx, gcancel := context.WithCancel(context.Background())
+	t.Cleanup(gcancel)
+	sipGW.watch(gctx) // what main does before waiting for the LAN address
+	bb := newBBGateway(nil, broker, testToken, "", slog.Default())
+	bb.sipGW, bb.sipPhone = sipGW, sipGW.registered
+	srv := httptest.NewServer(bb.routes())
+	t.Cleanup(srv.Close)
+
+	p := dialTunnelPhone(t, srv.URL)
+	p.text(`{"type":"sip.open"}`)
+	reg := &sipMsg{Method: "REGISTER", URI: "sip:wacalls.local"}
+	reg.Add("Via", "SIP/2.0/TCP 127.0.0.1:18724;branch=z9hG4bKr1")
+	reg.Add("From", "<sip:wacalls@wacalls.local>;tag=1")
+	reg.Add("To", "<sip:wacalls@wacalls.local>")
+	reg.Add("Call-ID", "reg@127.0.0.1")
+	reg.Add("CSeq", "1 REGISTER")
+	reg.Add("Contact", "<sip:wacalls@127.0.0.1:18724;transport=tcp>")
+	p.sendSIP(reg)
+	if r := p.readSIP(); r.Code != 200 {
+		t.Fatalf("REGISTER over the link: %s", r.Bytes())
+	}
+	waitFor(t, "registration", sipGW.registered)
+
+	broker.emitIncoming("s1", "waL", "393331234567@s.whatsapp.net", false)
+	if inv := p.readSIP(); inv.Method != "INVITE" {
+		t.Fatalf("an incoming call must ring the phone without the LAN listener: %s", inv.Bytes())
+	}
+}
