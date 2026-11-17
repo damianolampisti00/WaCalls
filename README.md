@@ -17,7 +17,7 @@ Built for native VoIP media, multi-account (multi-session) operation, and a mode
 
 ---
 
-> **Fork note:** this fork adds the [Berry Bridge gateway](#berry-bridge-gateway-blackberry-10) for BlackBerry 10 phones. Everything else is upstream WaCalls.
+> **Fork note:** this fork adds the [Berry Bridge gateway](#berry-bridge-gateway-blackberry-10) for BlackBerry 10 phones, including the native Phone app's SIP/RTP relay. Everything else is upstream WaCalls. This fork's `cmd/server` links the gateway's cgo code, so building it needs the Opus and WebRTC AEC libraries (see [Requirements](#requirements)); the pure-Go/no-cgo notes below describe the upstream browser path.
 
 ## Overview
 
@@ -27,11 +27,12 @@ as **raw 16 kHz PCM over a WebRTC data channel** to the Go server, which encodes
 Meta's **MLow** codec and injects the media into WhatsApp's **SRTP relay** mesh — and the
 reverse path brings the peer's audio back to the browser.
 
-The entire VoIP stack runs **natively in pure Go**: the MLow voice codec, **RTP/SRTP**
+The upstream VoIP stack runs **natively in pure Go**: the MLow voice codec, **RTP/SRTP**
 packetization, **STUN**, the **WebRTC/SCTP relay** transport and the `<call>` signaling,
 integrated with [**whatsmeow**](https://github.com/tulir/whatsmeow) and served to a
-**React 19** client. There is **no cgo and no native DLL** — the MLow codec is a vendored
-pure-Go package, so a plain `go build` produces a self-contained binary with live audio.
+**React 19** client. The MLow codec is a vendored pure-Go package, so upstream's plain
+`go build` produces a self-contained binary with live audio. This fork's gateway adds
+cgo for Opus and WebRTC AEC3 (see [Requirements](#requirements)).
 
 Multiple WhatsApp accounts can be paired and operated side by side, each with its own
 pairing QR, connection status, and history. A single account can also run **several
@@ -121,9 +122,10 @@ by tests in `internal/voip` (`go test ./...`).
 
 - **Go 1.26+**
 - **Node 22+** and **npm** (only to build/run the React client)
-
-No C compiler, cgo, or native libraries are required — the MLow codec is vendored
-pure Go (`internal/voip/media/mlow`).
+- **cgo** with `pkg-config opus` and `pkg-config webrtc-audio-processing-1` — for the
+  Berry Bridge gateway (Opus audio and WebRTC AEC3). The upstream browser path and the
+  MLow codec are pure Go, but this fork's `cmd/server` compiles the gateway's cgo files
+  too, so `CGO_ENABLED=0` does not link.
 
 ---
 
@@ -147,8 +149,9 @@ cd client && npm install && cd ..
 go run ./cmd/server -addr :8080          # add -debug for verbose logs
 ```
 
-Live audio works out of the box — the MLow codec is pure Go, so a plain build
-includes it. No build tags, no `CGO_ENABLED`, no DLLs.
+Live audio works out of the box on the browser path — the MLow codec is pure Go.
+The fork's gateway additionally links Opus and AEC3 through cgo, so install the
+libraries from [Requirements](#requirements) before building `cmd/server`.
 
 Open `http://localhost:8080`, click **New session**, and scan the QR shown in the browser
 (it is also printed in the terminal) with **WhatsApp → Linked devices**. Add more accounts
@@ -288,15 +291,33 @@ Berry Bridge can also hand calls to the phone's own call engine (EBMService, the
 BBM Video engine used as a SIP terminal). The app relays the engine's SIP and RTP
 through the same authenticated WebSocket (`bbsiptunnel.go`), so WhatsApp calls
 ring and talk in the native Phone app, incoming and outgoing, wherever the tunnel
-works — not only on the home Wi-Fi. The gateway speaks SIP/RTP to the engine
-(PCMU 20 ms, or OPUS-WB with `-sip-opus`), carries the peer's H.264 video, and the
-root `dialhelper` next to EBMService (port 5071) starts outgoing calls in the
-Phone app.
+works — not only on the home Wi-Fi. Outgoing calls are started by the root
+`dialhelper` next to EBMService (port 5071); incoming ones ring the Phone app with
+a SIP INVITE, and the first client to answer (Phone app, in-app call screen or
+browser) claims the call and stops the others.
+
+- **Audio**: `-sip-opus` (default on) offers the engine's OPUS-WB first, with a
+  delayed offer (`-sip-delayed-offer`, default on) so the engine offers and picks
+  Opus; PCMU 20 ms is the fallback. On video calls WhatsApp sends audio in 120 ms
+  two-frame MLow blocks: the decoder splits them and the SIP pre-buffer starts at
+  140 ms so block boundaries are not underruns.
+- **H.264 video both ways**: the phone camera's Annex-B access units go to
+  WhatsApp on their own video SSRC and SRTP send context (`h264packetizer.go`),
+  separate from the audio context so both rollover counters stay valid. In the
+  other direction the gateway depacketizes the engine's H.264, follows its CVO
+  rotation and hands whole access units to the call core; the peer's picture is
+  turned upright for the Phone app.
+- **Fast answer**: while the phone rings with our non-ICE offer, AnyFirewall probes
+  and STUN checks are sent every 50 ms to the engine's media ports, so its
+  remote-data flag is set as soon as Answer is tapped, even across the LTE round
+  trip.
 
 `-sip-addr` enables the SIP gateway; without it `sip.open` is refused, even when
 only the tunnel is used. `-sip-allow` limits LAN registrations to the phone's
 networks. `-wa-video` enables WhatsApp's 1:1 H.264 video signaling: the camera
-button in Berry Bridge starts a video call that plays in the native Phone app.
+button in Berry Bridge starts a video call that plays in the native Phone app,
+with the phone's camera sent back to WhatsApp. `-wa-video-dump <dir>` writes each
+call's received WhatsApp video as Annex-B H.264 for analysis.
 
 ```bash
 ./wacalls -addr 127.0.0.1:8097 -db wacalls.db \
