@@ -41,6 +41,7 @@ func (m *CallManager) initSrtpKeysLocked() {
 		return
 	}
 	m.srtpSession = sess
+	m.initVideoSenderLocked()
 	m.keyInfo = CallKeyInfo{CallID: call.CallID, EncryptionKey: call.EncryptionKey, OurDevice: ourDeviceJid,
 		PeerDevice: peerDeviceJid, Participants: participants, SendKey: sendKM.MasterKey, SendSalt: sendKM.MasterSalt,
 		RecvKey: recvKM.MasterKey, RecvSalt: recvKM.MasterSalt}
@@ -65,8 +66,34 @@ func (m *CallManager) reinitSrtpLocked(peerKey []byte, peerJid types.JID) {
 	}
 	if sess, err := media.NewSrtpSession(sendKM, recvKM, core.SRTPSendAuthTagLen, core.SRTPRecvAuthTagLen); err == nil {
 		m.srtpSession = sess
+		m.initVideoSenderLocked()
 		m.keyInfo.PeerCallKey, m.keyInfo.PeerDevice = peerKey, peerJid.String()
 		m.keyInfo.RecvKey, m.keyInfo.RecvSalt = recvKM.MasterKey, recvKM.MasterSalt
 		m.log.Debug("srtp re-initialized with peer call key")
+	}
+}
+
+func (m *CallManager) initVideoSenderLocked() {
+	call := m.currentCall
+	if call == nil || call.MediaType != core.CallMediaTypeVideo {
+		m.selfVideoSsrc, m.videoRTP, m.videoSend = 0, nil, nil
+		return
+	}
+	ourBase := wanode.CleanJID(m.ownCredJid())
+	var participants []string
+	if call.RelayData != nil {
+		participants = call.RelayData.ParticipantJids
+	}
+	device := ensureDeviceJid(findOurDevice(participants, ourBase, m.ownCredJid()))
+	m.selfVideoSsrc = media.GenerateSecureSsrc(call.CallID, device, 1)
+	m.videoRTP = media.NewH264Packetizer(m.selfVideoSsrc, 0)
+	m.videoSend = nil
+	if m.srtpSession != nil {
+		ctx, err := m.srtpSession.NewSendContext()
+		if err != nil {
+			m.log.Error("video SRTP context failed", "err", err)
+		} else {
+			m.videoSend = ctx
+		}
 	}
 }

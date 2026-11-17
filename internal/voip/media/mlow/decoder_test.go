@@ -63,8 +63,36 @@ func TestE2EDecodeMatchesUseSmpl(t *testing.T) {
 		t.Fatalf("correlation undefined: constant signal (sxx=%v syy=%v)", sxx, syy)
 	}
 	corr := sxy / denom
-	t.Logf("e2e lag-0 correlation vs useSmpl reference: %.4f", corr)
+	t.Logf("e2e lag-0 corr %.4f", corr)
 	if corr <= 0.95 {
 		t.Errorf("lag-0 corr %.4f <= 0.95 vs useSmpl reference", corr)
+	}
+}
+
+func TestDecodeMultiFramePayload(t *testing.T) {
+	// Packet 5 from video call 005333327FB7E64044E6677C9DA818C6 (2026-11-09):
+	// 0x92 0x02 0x13 followed by a 19-byte 60 ms MLow frame and an 18-byte 60 ms MLow frame.
+	f1, _ := hex.DecodeString("5046eb5a24ddaffe806b866fc146c8d9556e40")
+	f2, _ := hex.DecodeString("5021e161c25d31c771b046c8d9556e401234")
+	multi := append([]byte{0x92, 0x02, byte(len(f1))}, f1...)
+	multi = append(multi, f2...)
+
+	decMulti := NewMlowDecoder()
+	got := decMulti.Decode(multi)
+	if len(got) != 2*opusFrameSamps {
+		t.Fatalf("multi-frame Decode len = %d, want %d", len(got), 2*opusFrameSamps)
+	}
+
+	decSingle := NewMlowDecoder()
+	want := append(decSingle.Decode(f1), decSingle.Decode(f2)...)
+	var sumSq float64
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sample %d mismatch: got %v, want %v", i, got[i], want[i])
+		}
+		sumSq += float64(got[i] * got[i])
+	}
+	if sumSq == 0 {
+		t.Fatal("decoded multi-frame audio is completely silent")
 	}
 }

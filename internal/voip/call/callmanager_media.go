@@ -58,6 +58,41 @@ func (m *CallManager) FeedCapturedPCM(data []float32) {
 	}
 }
 
+// FeedCapturedVideo sends one Annex-B H.264 access unit from the local SIP
+// camera stream to WhatsApp. Video has its own SSRC and SRTP packet index;
+// reusing the audio context would corrupt both streams' rollover counters.
+func (m *CallManager) FeedCapturedVideo(au media.AccessUnit) {
+	if len(au.Data) == 0 || len(au.Data) > 1<<20 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.currentCall == nil || m.currentCall.MediaType != core.CallMediaTypeVideo ||
+		m.currentCall.StateData.State != core.CallStateActive ||
+		m.videoRTP == nil || m.videoSend == nil || !m.relay.HasConnection() {
+		return
+	}
+	packets, err := m.videoRTP.Packetize(au.Data, au.TS, au.Rotation)
+	if err != nil {
+		m.log.Debug("video packetize error", "err", err)
+		return
+	}
+	for _, pkt := range packets {
+		protected, err := m.videoSend.Protect(pkt)
+		if err != nil {
+			m.log.Debug("video srtp protect error", "err", err)
+			continue
+		}
+		if m.OnRawMedia != nil {
+			m.OnRawMedia(true, protected)
+		}
+		if m.OnSentVideo != nil {
+			m.OnSentVideo(protected)
+		}
+		m.relay.Broadcast(protected)
+	}
+}
+
 func (m *CallManager) sendOpusFrameLocked(opus []byte) {
 	if m.rtpSession == nil || m.srtpSession == nil {
 		return
@@ -177,7 +212,16 @@ func (m *CallManager) onRelayData(data []byte) {
 	if err != nil {
 		return
 	}
-	pcm = media.NormalizeFrame(pcm, codec.FrameSize())
+	fs := codec.FrameSize()
+	if len(pcm) > fs && len(pcm)%fs == 0 {
+		if m.OnPeerAudio != nil {
+			for off := 0; off < len(pcm); off += fs {
+				m.OnPeerAudio(pcm[off : off+fs])
+			}
+		}
+		return
+	}
+	pcm = media.NormalizeFrame(pcm, fs)
 	if m.OnPeerAudio != nil {
 		m.OnPeerAudio(pcm)
 	}

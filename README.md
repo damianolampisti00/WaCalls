@@ -282,6 +282,28 @@ Cloudflare tunnel; for a long-lived audio stream prefer HTTP/2 transport over
 QUIC). The browser API on `-addr` still has no authentication: keep it on
 localhost. Without `-bb-addr` the server behaves exactly like upstream.
 
+### Native Phone app (SIP/RTP relay)
+
+Berry Bridge can also hand calls to the phone's own call engine (EBMService, the
+BBM Video engine used as a SIP terminal). The app relays the engine's SIP and RTP
+through the same authenticated WebSocket (`bbsiptunnel.go`), so WhatsApp calls
+ring and talk in the native Phone app, incoming and outgoing, wherever the tunnel
+works — not only on the home Wi-Fi. The gateway speaks SIP/RTP to the engine
+(PCMU 20 ms, or OPUS-WB with `-sip-opus`), carries the peer's H.264 video, and the
+root `dialhelper` next to EBMService (port 5071) starts outgoing calls in the
+Phone app.
+
+`-sip-addr` enables the SIP gateway; without it `sip.open` is refused, even when
+only the tunnel is used. `-sip-allow` limits LAN registrations to the phone's
+networks. `-wa-video` enables WhatsApp's 1:1 H.264 video signaling: the camera
+button in Berry Bridge starts a video call that plays in the native Phone app.
+
+```bash
+./wacalls -addr 127.0.0.1:8097 -db wacalls.db \
+          -bb-addr 127.0.0.1:8098 -bb-token-file bb_token \
+          -sip-addr 127.0.0.1:5070 -wa-video
+```
+
 ## Contributors
 
 This project builds on the work of:

@@ -26,11 +26,14 @@ type CallManager struct {
 	// the peer's video streams: one receive context per SSRC, for videoSess
 	videoSess *media.SrtpSession
 	videoRecv map[uint32]*media.SrtpContext
+	videoSend *media.SrtpContext
+	videoRTP  *media.H264Packetizer
 	keyInfo   CallKeyInfo // what the SRTP keys were derived from (capture)
 	codec     media.Codec
 	relay     RelayTransport
 
 	selfSsrc      uint32
+	selfVideoSsrc uint32
 	peerSsrcs     []uint32
 	actualPeerSet bool
 
@@ -60,6 +63,8 @@ type CallManager struct {
 	// OnSentPCM gets each frame sent to the peer (captured audio or the
 	// keep-alive silence), in order: an echo canceller's reference.
 	OnSentPCM func([]float32)
+	// OnSentVideo receives each protected outgoing H.264 RTP packet.
+	OnSentVideo func([]byte)
 }
 
 func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
@@ -116,6 +121,10 @@ func (m *CallManager) StartCall(ctx context.Context, callID string, peerJid type
 
 	selfJid := creator.String()
 	m.selfSsrc = media.GenerateSecureSsrc(callID, selfJid, 0)
+	if isVideo {
+		m.selfVideoSsrc = media.GenerateSecureSsrc(callID, selfJid, 1)
+		m.videoRTP = media.NewH264Packetizer(m.selfVideoSsrc, 0)
+	}
 	m.rtpSession = media.NewWhatsAppOpusSession(m.selfSsrc)
 	m.peerSsrcs = []uint32{media.GenerateSecureSsrc(callID, resolved.String(), 0)}
 	m.initCodec()

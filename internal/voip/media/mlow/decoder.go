@@ -71,7 +71,40 @@ func (d *MlowDecoder) Decode(payload []byte) []float32 {
 		d.log.Trace().Int("red_frames", len(frames)).Int("main_bytes", len(main)).Msg("decode: RED depacked")
 		return d.decodeFrame(main)
 	}
+	if frames := unpackMultiFrame(payload); len(frames) > 1 {
+		out := make([]float32, 0, len(frames)*opusFrameSamps)
+		for _, f := range frames {
+			out = append(out, d.decodeFrame(f)...)
+		}
+		return out
+	}
 	return d.decodeFrame(payload)
+}
+
+// unpackMultiFrame splits an MLow multi-frame RTP payload (header byte 0x92,
+// frame count N in p[1], N-1 byte lengths in p[2:1+N], followed by the N bare
+// MLow frames in chronological order, as sent in video calls when
+// max_frames_per_packet > 1). Returns nil if p is not a multi-frame packet.
+func unpackMultiFrame(p []byte) [][]byte {
+	if len(p) < 4 || p[0] != 0x92 {
+		return nil
+	}
+	cnt := int(p[1])
+	if cnt < 2 || cnt > 8 || len(p) <= 1+cnt {
+		return nil
+	}
+	cur := 1 + cnt
+	frames := make([][]byte, 0, cnt)
+	for i := 0; i < cnt-1; i++ {
+		sz := int(p[2+i])
+		if sz <= 0 || cur+sz >= len(p) {
+			return nil
+		}
+		frames = append(frames, p[cur:cur+sz])
+		cur += sz
+	}
+	frames = append(frames, p[cur:])
+	return frames
 }
 
 func (d *MlowDecoder) decodeFrame(frame []byte) []float32 {

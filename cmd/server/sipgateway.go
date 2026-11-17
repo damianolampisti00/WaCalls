@@ -9,13 +9,15 @@ package main
 // - The phone registers over one TCP connection (REGISTER, any credentials:
 //   the listener is limited to -sip-allow networks). Calls to the phone and
 //   from it run over that same connection.
-// - A WhatsApp call coming in rings the phone: INVITE with an audio-only SDP
-//   offer (PCMU). The phone's 200 OK claims and accepts the WhatsApp call;
+// - A WhatsApp call coming in rings the phone: INVITE with an audio SDP offer
+//   (PCMU) and, for a video call, an H.264 video stream. The phone's 200 OK
+//   claims and accepts the WhatsApp call;
 //   a 4xx/6xx declines it. If the caller gives up first: CANCEL.
 // - An INVITE from the phone places a WhatsApp call to the number in its
 //   Request-URI (sip:393331234567@...): 180 while it rings, 200 when answered.
 // - Hang up from either side: BYE (or CANCEL / an error response).
-// - Audio: siprtp.go (PCMU 20 ms <-> the call core's 16 kHz PCM). The phone
+// - Media: siprtp.go (PCMU 20 ms <-> 16 kHz PCM, plus H.264 RTP/SRTP for
+//   video calls). The phone
 //   cancels its own echo.
 //
 // The protocol details of the phone's engine are in the BBM Video research
@@ -37,6 +39,7 @@ import (
 	"time"
 
 	"wacalls/internal/voip/core"
+	"wacalls/internal/voip/media"
 
 	"go.mau.fi/whatsmeow/types"
 )
@@ -52,12 +55,13 @@ const (
 type sipBackend interface {
 	SessionID() string
 	PhoneOf(peerJID string) string
-	StartCall(ctx context.Context, phone string) (callID string, err error)
+	StartCall(ctx context.Context, phone string, video bool) (callID string, err error)
 	Accept(ctx context.Context, callID string) error
 	Reject(ctx context.Context, callID string)
 	Hangup(ctx context.Context, callID string)
 	Attach(callID string, b mediaBridge)
 	Feed(callID string, pcm []float32)
+	FeedVideo(callID string, au media.AccessUnit)
 }
 
 type sipConfig struct {
@@ -153,6 +157,8 @@ type sipCall struct {
 	mediaIP    string
 	sessionID  int64
 	pendingRTP rtpTransport
+	stopProbe  chan struct{}
+	probeDone  chan struct{}
 }
 
 func newSIPGateway(be sipBackend, broker *Broker, cfg sipConfig, log *slog.Logger) *sipGateway {
@@ -549,7 +555,70 @@ func (g *sipGateway) sendInvite(c *sipCall) error {
 		inv.Body = buildSDPFull(ip, c.pendingRTP.LocalPort(), c.sessionID, false, c.video, g.offerCodecs()...)
 	}
 	c.invite = inv
-	return p.send(inv)
+	if err := p.send(inv); err != nil {
+		return err
+	}
+	g.startPreProbe(c)
+	return nil
+}
+
+// startPreProbe sends AnyFirewall probe packets (PT=127) every 50 ms over the
+// BerryBridge tunnel to EBMService's local media ports (45536/45535 and, for
+// video, 45538/45537) while the phone is ringing with our non-ICE SDP offer.
+// Because EBMService arms CAfChannel timer 3 (300 ms in EBMService.wa.t3) inside
+// FinishConnect at the exact moment the user taps Answer (before 200 OK even
+// crosses the LTE uplink), having probes already arriving every 50 ms ensures
+// m_bRemoteDataReceived ([r4, #0x4d0]) becomes 1 within 0-50 ms of Answer,
+// regardless of LTE round-trip latency.
+func (g *sipGateway) startPreProbe(c *sipCall) {
+	g.mu.Lock()
+	if c.delayed || c.phone == nil || c.phone.newMedia == nil || c.pendingRTP == nil || c.stopProbe != nil {
+		g.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	c.stopProbe, c.probeDone = stop, done
+	conn := c.pendingRTP
+	video := c.video
+	g.mu.Unlock()
+
+	ports := []int{45536, 45535}
+	if video {
+		ports = append(ports, 45538, 45537)
+	}
+	loopback := net.IPv4(127, 0, 0, 1)
+	go func() {
+		defer close(done)
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+		start := time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if time.Since(start) > 60*time.Second {
+					return
+				}
+				pkt := probePacket(uint32(time.Since(start).Milliseconds()))
+				for _, p := range ports {
+					_, _ = conn.WriteTo(pkt, &net.UDPAddr{IP: loopback, Port: p})
+				}
+			}
+		}
+	}()
+}
+
+func (g *sipGateway) stopPreProbe(c *sipCall) {
+	g.mu.Lock()
+	stop, done := c.stopProbe, c.probeDone
+	c.stopProbe, c.probeDone = nil, nil
+	g.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 }
 
 func (g *sipGateway) onResponse(ctx context.Context, p *sipPhone, m *sipMsg) {
@@ -785,11 +854,11 @@ func (g *sipGateway) onInvite(ctx context.Context, p *sipPhone, m *sipMsg) {
 	}
 	c := &sipCall{sipID: m.Get("call-id"), phone: p, localTag: sipRandom(6), invite: m,
 		target: sipAddrURI(m.Get("contact")), cseq: 1, offer: offer, codec: codec, mediaIP: ip,
-		sessionID: time.Now().Unix(), pendingRTP: conn}
+		sessionID: time.Now().Unix(), pendingRTP: conn, video: offer.Video}
 	g.mu.Lock()
 	g.dialog[c.sipID] = c
 	g.mu.Unlock()
-	waID, err := g.be.StartCall(ctx, num)
+	waID, err := g.be.StartCall(ctx, num, offer.Video)
 	if err != nil {
 		g.log.Warn("placing the WhatsApp call failed", "to", num, "err", err)
 		_ = p.send(sipResponse(m, 480, "Temporarily Unavailable", c.localTag))
@@ -819,7 +888,7 @@ func (g *sipGateway) waConnected(waID string) {
 	r.Add("Contact", fmt.Sprintf("<sip:wacalls@%s;transport=tcp>", c.mediaIP))
 	r.Add("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS")
 	r.Add("Content-Type", "application/sdp")
-	r.Body = buildSDP(c.mediaIP, port, c.sessionID, c.offer.Video, c.codec)
+	r.Body = buildSDPFull(c.mediaIP, port, c.sessionID, false, c.video, c.codec)
 	g.startMedia(c, c.offer)
 	_ = c.phone.send(r)
 	g.log.Info("whatsapp peer answered", "call_id", waID)
@@ -860,6 +929,7 @@ func (g *sipGateway) onPhoneHangup(ctx context.Context, sipID, why string) {
 // ---- media and bookkeeping -------------------------------------------------
 
 func (g *sipGateway) startMedia(c *sipCall, remote *sdpAudio) {
+	g.stopPreProbe(c)
 	dst := &net.UDPAddr{IP: net.ParseIP(remote.IP), Port: remote.Port}
 	rtcpPort := remote.RTCPPort
 	if c.phone.newMedia != nil && remote.HostPort > 0 {
@@ -871,6 +941,10 @@ func (g *sipGateway) startMedia(c *sipCall, remote *sdpAudio) {
 	pacer := newBBUpPacer(func(pcm []float32) { g.be.Feed(waID, pcm) })
 	rtp := newSIPRTP(c.pendingRTP, dst, c.codec, pacer.push, g.log.With("call_id", waID))
 	rtp.iceUfrag, rtp.icePwd, rtp.rtcpPort = remote.Ufrag, remote.Pwd, rtcpPort
+	if c.video && remote.Video {
+		rtp.phoneVideoPT = remote.VideoPT
+		rtp.onPhoneVideo = func(au media.AccessUnit) { g.be.FeedVideo(waID, au) }
+	}
 	if c.video && remote.Video && remote.VideoPort > 0 {
 		vdst := &net.UDPAddr{IP: dst.IP, Port: remote.VideoPort}
 		vrtcp := remote.VideoRTCPPort
@@ -905,8 +979,14 @@ func (g *sipGateway) forget(c *sipCall) {
 		delete(g.dialog, c.sipID)
 	}
 	rtp, pacer, pending := c.rtp, c.pacer, c.pendingRTP
+	stop, done := c.stopProbe, c.probeDone
 	c.rtp, c.pacer, c.pendingRTP = nil, nil, nil
+	c.stopProbe, c.probeDone = nil, nil
 	g.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 	if pacer != nil {
 		pacer.close()
 	}
@@ -945,13 +1025,13 @@ func (b *sessionBackend) PhoneOf(peer string) string {
 	return phoneOfJID(s, peer)
 }
 
-func (b *sessionBackend) StartCall(ctx context.Context, phone string) (string, error) {
+func (b *sessionBackend) StartCall(ctx context.Context, phone string, video bool) (string, error) {
 	s, err := b.session()
 	if err != nil {
 		return "", err
 	}
 	peer := types.NewJID(phone, types.DefaultUserServer)
-	callID, err := s.startOutgoing(ctx, peer, false)
+	callID, err := s.startOutgoing(ctx, peer, video)
 	if err != nil {
 		return "", err
 	}
@@ -959,6 +1039,16 @@ func (b *sessionBackend) StartCall(ctx context.Context, phone string) (string, e
 	b.broker.upsertCall(CallRecord{SessionID: s.id, CallID: callID, Owner: &owner, Direction: "outbound",
 		Peer: peer.String(), StartedAt: time.Now().UnixMilli(), Status: StatusRinging})
 	return callID, nil
+}
+
+func (b *sessionBackend) FeedVideo(callID string, au media.AccessUnit) {
+	s, err := b.session()
+	if err != nil {
+		return
+	}
+	if ac, ok := s.reg.get(callID); ok && ac.cm != nil {
+		ac.cm.FeedCapturedVideo(au)
+	}
 }
 
 func (b *sessionBackend) Accept(ctx context.Context, callID string) error {

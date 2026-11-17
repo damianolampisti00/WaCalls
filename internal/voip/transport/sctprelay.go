@@ -55,6 +55,7 @@ type SctpRelayManager struct {
 	log         *slog.Logger
 
 	audioSsrc        uint32
+	videoSsrc        uint32
 	subscriptionSsrc uint32
 
 	onConnected func(ip string, port int)
@@ -73,6 +74,8 @@ func NewSctpRelayManager(log *slog.Logger) *SctpRelayManager {
 }
 
 func (m *SctpRelayManager) SetSsrc(ssrc uint32) { m.audioSsrc = ssrc }
+
+func (m *SctpRelayManager) SetVideoSsrc(ssrc uint32) { m.videoSsrc = ssrc }
 
 func (m *SctpRelayManager) SetSubscriptionSsrc(ssrc uint32) { m.subscriptionSsrc = ssrc }
 
@@ -274,6 +277,9 @@ func (m *SctpRelayManager) sendStunRegistration(conn *relayConnection) {
 			return
 		}
 		subs := BuildSenderSubscriptions(ssrc)
+		if m.videoSsrc != 0 {
+			subs = append(subs, BuildSenderSubscriptions(m.videoSsrc)...)
+		}
 
 		if localUfrag != "" {
 			username := []byte(remoteUfrag + ":" + localUfrag)
@@ -290,7 +296,11 @@ func (m *SctpRelayManager) sendStunRegistration(conn *relayConnection) {
 			if m.subscriptionSsrc != 0 {
 				peerSsrcs = []uint32{m.subscriptionSsrc}
 			}
-			ssrcList := BuildSSRCSubscriptionList([]uint32{m.audioSsrc}, peerSsrcs, 0, 0)
+			selfSsrcs := []uint32{m.audioSsrc}
+			if m.videoSsrc != 0 {
+				selfSsrcs = append(selfSsrcs, m.videoSsrc)
+			}
+			ssrcList := BuildSSRCSubscriptionList(selfSsrcs, peerSsrcs, 0, 0)
 			m.sendRaw(conn, BuildAllocateForRelay(info.RawToken, ssrcList, hmacKey, info.IP, info.Port))
 		}
 	}
@@ -427,6 +437,7 @@ func (m *SctpRelayManager) Cleanup() {
 	}
 	m.connections = map[string]*relayConnection{}
 	m.audioSsrc = 0
+	m.videoSsrc = 0
 	m.subscriptionSsrc = 0
 	m.mu.Unlock()
 	for _, c := range conns {

@@ -171,6 +171,7 @@ func (c *SrtpContext) computeAuthTag(data []byte, roc uint32, tagLen int) []byte
 type SrtpSession struct {
 	sendCtx *SrtpContext
 	recvCtx *SrtpContext
+	sendKey core.SrtpKeyingMaterial
 	recvKey core.SrtpKeyingMaterial
 	recvTag int
 }
@@ -184,7 +185,13 @@ func NewSrtpSession(sendKey, recvKey core.SrtpKeyingMaterial, sendAuthLen, recvA
 	if err != nil {
 		return nil, err
 	}
-	return &SrtpSession{sendCtx: sc, recvCtx: rc, recvKey: recvKey, recvTag: recvAuthLen}, nil
+	return &SrtpSession{sendCtx: sc, recvCtx: rc, sendKey: sendKey, recvKey: recvKey, recvTag: recvAuthLen}, nil
+}
+
+// NewSendContext creates an independent SRTP packet-index context for another
+// local SSRC (video), while using the same per-call send key material.
+func (s *SrtpSession) NewSendContext() (*SrtpContext, error) {
+	return NewSrtpContext(s.sendKey, s.sendCtx.authTagLen)
 }
 
 // NewRecvContext: a receive context with the session's keys and its own

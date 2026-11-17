@@ -69,6 +69,9 @@ func (m *CallManager) connectRelays(endpoints []core.RelayEndpoint) {
 	}
 	m.mu.Lock()
 	m.relay.SetSsrc(m.selfSsrc)
+	if r, ok := m.relay.(interface{ SetVideoSsrc(uint32) }); ok {
+		r.SetVideoSsrc(m.selfVideoSsrc)
+	}
 	m.relay.SetSubscriptionSsrc(firstSsrc(m.peerSsrcs))
 	m.mu.Unlock()
 	m.relay.ConfigureRelays(relays)
@@ -86,6 +89,9 @@ func (m *CallManager) cleanupMedia() {
 	}
 	m.rtpSession = nil
 	m.srtpSession = nil
+	m.videoRTP = nil
+	m.videoSend = nil
+	m.selfVideoSsrc = 0
 	m.firstPacketSent = false
 	m.initialTransportSent = false
 	m.outgoingPreacceptSent = false

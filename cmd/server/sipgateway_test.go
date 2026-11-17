@@ -155,14 +155,17 @@ func TestRTPPayloadSkipsHeaderExtensions(t *testing.T) {
 // ---- the gateway against a fake phone --------------------------------------
 
 type fakeBackend struct {
-	mu       sync.Mutex
-	started  []string
-	accepted []string
-	rejected []string
-	hungUp   []string
-	attached map[string]mediaBridge
-	fed      int
-	fedLevel float64
+	mu           sync.Mutex
+	started      []string
+	startedVideo []bool
+	accepted     []string
+	rejected     []string
+	hungUp       []string
+	attached     map[string]mediaBridge
+	fed          int
+	fedLevel     float64
+	fedVideo     int
+	videoBytes   int
 }
 
 func (f *fakeBackend) SessionID() string          { return "s1" }
@@ -176,9 +179,10 @@ func (f *fakeBackend) Hangup(_ context.Context, id string) {
 	defer f.lock()()
 	f.hungUp = append(f.hungUp, id)
 }
-func (f *fakeBackend) StartCall(_ context.Context, phone string) (string, error) {
+func (f *fakeBackend) StartCall(_ context.Context, phone string, video bool) (string, error) {
 	defer f.lock()()
 	f.started = append(f.started, phone)
+	f.startedVideo = append(f.startedVideo, video)
 	return "wa-out-1", nil
 }
 func (f *fakeBackend) Accept(_ context.Context, id string) error {
@@ -199,6 +203,11 @@ func (f *fakeBackend) Feed(_ string, pcm []float32) {
 	if r := rms(pcm); r > f.fedLevel {
 		f.fedLevel = r
 	}
+}
+func (f *fakeBackend) FeedVideo(_ string, au media.AccessUnit) {
+	defer f.lock()()
+	f.fedVideo++
+	f.videoBytes += len(au.Data)
 }
 
 type fakePhone struct {
@@ -452,9 +461,24 @@ func TestSIPGatewayPhoneCallsOut(t *testing.T) {
 		t.Fatalf("want 200 with SDP: %s", ok.Bytes())
 	}
 	ans, err := parseSDP(ok.Body)
-	if err != nil || !ans.hasPCMU() || !strings.Contains(string(ok.Body), "m=video 0 ") {
-		t.Fatalf("answer must keep audio and refuse video: %s", ok.Body)
+	be.mu.Lock()
+	startedVideo := len(be.startedVideo) > 0 && be.startedVideo[0]
+	be.mu.Unlock()
+	if err != nil || !ans.hasPCMU() || !ans.Video || !startedVideo {
+		t.Fatalf("answer must keep audio and accept the phone's video offer (start=%v): %s", be.startedVideo, ok.Body)
 	}
+	videoPacket, err := (&media.RtpPacket{Header: media.NewRtpHeader(109, 1, 9000, 77), Payload: []byte{0x65, 0x01, 0x02}}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	videoPacket[1] |= 0x80 // final packet in this access unit
+	if _, err := p.rtp.WriteToUDP(videoPacket, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ans.Port}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "phone video forwarded", func() bool {
+		defer be.lock()()
+		return be.fedVideo == 1 && be.videoBytes >= 7
+	})
 	p.readRTP() // media flows
 	broker.endCall("wa-out-1", "user_ended")
 	if bye := p.read(); bye.Method != "BYE" || sipParam(bye.Get("to"), "tag") != "me" ||
@@ -731,5 +755,41 @@ func TestSIPGatewayVideoCallOffersVideo(t *testing.T) {
 	be.mu.Unlock()
 	if _, ok := br.(interface{ WriteVideo(media.AccessUnit) }); !ok {
 		t.Fatal("the bridge takes no video")
+	}
+}
+
+func TestSIPRTPProbesAllMediaAndRTCPPorts(t *testing.T) {
+	type pktPort struct {
+		port int
+		pkt  []byte
+	}
+	sent := make(chan pktPort, 256)
+	tr := newTunnelRTP(func(port int, p []byte) bool {
+		sent <- pktPort{port: port, pkt: append([]byte(nil), p...)}
+		return true
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := newSIPRTP(tr, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45536}, codecPCMU, nil, log)
+	r.rtcpPort = 45535
+	r.extraChecks = []int{45538, 45537}
+	r.start()
+	defer r.close()
+
+	probed := map[int]bool{}
+	deadline := time.After(500 * time.Millisecond)
+	for len(probed) < 4 {
+		select {
+		case pp := <-sent:
+			if isProbe(pp.pkt) {
+				probed[pp.port] = true
+			}
+		case <-deadline:
+			t.Fatalf("missing AnyFirewall probes on some ports; got %v", probed)
+		}
+	}
+	for _, want := range []int{45536, 45535, 45538, 45537} {
+		if !probed[want] {
+			t.Fatalf("missing probe on port %d", want)
+		}
 	}
 }

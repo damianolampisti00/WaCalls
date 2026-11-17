@@ -336,9 +336,10 @@ func buildSDPFull(ip string, port int, sessID int64, rejectVideo, video bool, co
 
 const (
 	rtpFrame = 160 // 20 ms at 8 kHz (PCMU); Opus frames are bbOpusFrame at 16 kHz
-	// WhatsApp's audio comes in 60 ms blocks: start (and restart after a
-	// gap) with 80 ms queued, or every block boundary is an underrun.
-	rtpPrebufferFrames   = 4
+	// WhatsApp's audio comes in 60 ms blocks (or 120 ms two-frame blocks in
+	// video calls): start (and restart after a gap) with 140 ms queued, or
+	// every block boundary is an underrun.
+	rtpPrebufferFrames   = 7
 	rtpMaxBufferedFrames = 20 // 400 ms: beyond this the oldest audio goes
 )
 
@@ -371,7 +372,11 @@ type sipRTP struct {
 	rtcpPort         int
 	extraChecks      []int     // more of the phone's ports for ICE checks (its video's)
 	video            *sipVideo // the peer's video to the phone, when negotiated
-	frame            int       // samples per 20 ms packet in down: 160 (PCMU, 8 kHz) or 320 (Opus, 16 kHz)
+	phoneVideoPT     int
+	phoneVideoDepack media.H264Depacketizer
+	phoneVideoRot    int
+	onPhoneVideo     func(media.AccessUnit)
+	frame            int // samples per 20 ms packet in down: 160 (PCMU, 8 kHz) or 320 (Opus, 16 kHz)
 	enc              *bbOpusEncoder
 	dec              *bbOpusDecoder
 
@@ -491,18 +496,26 @@ func (r *sipRTP) sender() {
 			return
 		case <-t.C:
 		}
-		if tick%probeEvery == 0 && time.Since(start) < probeFor {
+		if (tick < 15 || tick%probeEvery == 0) && time.Since(start) < probeFor {
 			if dst := r.remote.Load(); dst != nil {
-				_, _ = r.conn.WriteTo(probePacket(uint32(time.Since(start).Milliseconds())), dst)
+				probe := probePacket(uint32(time.Since(start).Milliseconds()))
+				stunReq := stunBindingRequestFor(r.iceUfrag, r.icePwd)
+				if r.recv.Load() == 0 {
+					_, _ = r.conn.WriteTo(probe, dst)
+				}
 				// ICE checks on both components (sipstun.go)
-				_, _ = r.conn.WriteTo(stunBindingRequestFor(r.iceUfrag, r.icePwd), dst)
+				_, _ = r.conn.WriteTo(stunReq, dst)
 				rtcp := r.rtcpPort
 				if rtcp == 0 {
 					rtcp = dst.Port + 1
 				}
-				_, _ = r.conn.WriteTo(stunBindingRequestFor(r.iceUfrag, r.icePwd), &net.UDPAddr{IP: dst.IP, Port: rtcp})
+				rtcpAddr := &net.UDPAddr{IP: dst.IP, Port: rtcp}
+				_, _ = r.conn.WriteTo(probe, rtcpAddr)
+				_, _ = r.conn.WriteTo(stunReq, rtcpAddr)
 				for _, p := range r.extraChecks {
-					_, _ = r.conn.WriteTo(stunBindingRequestFor(r.iceUfrag, r.icePwd), &net.UDPAddr{IP: dst.IP, Port: p})
+					extraAddr := &net.UDPAddr{IP: dst.IP, Port: p}
+					_, _ = r.conn.WriteTo(probe, extraAddr)
+					_, _ = r.conn.WriteTo(stunReq, extraAddr)
 				}
 			}
 		}
@@ -591,6 +604,22 @@ func (r *sipRTP) receiver() {
 			_, _ = r.conn.WriteTo(append([]byte(nil), buf[:n]...), from) // echo: the check's answer
 		}
 		payload, pt, ok := rtpPayload(buf[:n])
+		if ok && r.phoneVideoPT != 0 && pt == r.phoneVideoPT {
+			h, err := media.DecodeRtpHeader(buf[:n])
+			if err != nil {
+				continue
+			}
+			if rotation, ok := media.CVORotation(h); ok {
+				r.phoneVideoRot = rotation
+			}
+			for _, au := range r.phoneVideoDepack.Push(h.SequenceNumber, h.Timestamp, h.Marker, payload) {
+				au.Rotation = r.phoneVideoRot
+				if r.onPhoneVideo != nil {
+					r.onPhoneVideo(au)
+				}
+			}
+			continue
+		}
 		if !ok || pt != r.codec.PT {
 			// e.g. the engine's firewall probes (PT 127) or RTCP. The first
 			// few are logged: the engine starts its audio only ~5 s after
